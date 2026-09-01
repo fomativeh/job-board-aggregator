@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from datetime import datetime, timezone
-from typing import Optional, TypedDict, Union
+from typing import Any, Iterable, Optional, Sequence, TypedDict, Union
 
 SalaryType = Optional[str]
+
+log: logging.Logger = logging.getLogger(__name__)
 
 NULLABLE_FIELDS: set[str] = {"salary"}
 
@@ -20,6 +23,7 @@ REQUIRED_FIELDS: set[str] = {
 
 ALLOWED_SOURCES: set[str] = {"greenhouse", "weworkremotely", "remotive"}
 
+URL_HASH_FIELD: str = "url_hash"
 
 class JobListing(TypedDict):
     title: str
@@ -85,3 +89,26 @@ def validate_listing(listing: Union[dict[str, object], JobListing]) -> None:
             raise ValidationError(
                 f"Field 'scraped_at' must match ISO-8601 UTC format %Y-%m-%dT%H:%M:%SZ, got {scraped_at_value!r}"
             ) from exc
+
+
+def apply_url_hashes(listings: Sequence[JobListing]) -> list[dict[str, Any]]:
+    return [
+        {**listing, URL_HASH_FIELD: make_url_hash(listing["url"])}
+        for listing in listings
+    ]
+
+
+def dedup_in_memory(listings: Iterable[JobListing]) -> tuple[list[JobListing], int]:
+    seen_hashes: set[str] = set()
+    deduped: list[JobListing] = []
+    dropped = 0
+    for listing in listings:
+        url_hash = make_url_hash(listing["url"])
+        if url_hash in seen_hashes:
+            dropped += 1
+            continue
+        seen_hashes.add(url_hash)
+        deduped.append(listing)
+    if dropped:
+        log.warning("Pre-Mongo dedup dropped %d cross-source URL duplicates", dropped)
+    return deduped, dropped

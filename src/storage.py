@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Optional, Sequence
 
 from pymongo import MongoClient
 from pymongo.collection import Collection
@@ -17,11 +17,18 @@ from pymongo.errors import (
 )
 
 from .config import Config
-from .schema import JobListing, make_url_hash, validate_listing
+from .schema import URL_HASH_FIELD, JobListing, apply_url_hashes, validate_listing
 
 log: logging.Logger = logging.getLogger(__name__)
 
-URL_HASH_FIELD: str = "url_hash"
+# Re-exported from schema for historical callers (pipeline.py does
+# `from .storage import URL_HASH_FIELD`). Canonical definition lives in
+# schema.py as the single source of truth.
+__all__ = [
+    "URL_HASH_FIELD",
+    "MongoConnectionError",
+    "Storage",
+]
 
 MONGO_CONNECT_TIMEOUT_MS: int = 10_000
 MONGO_SERVER_SELECTION_TIMEOUT_MS: int = 10_000
@@ -83,12 +90,6 @@ class Storage:
             )
         return self._collection
 
-    @staticmethod
-    def _add_hash(listing: JobListing) -> dict[str, object]:
-        doc: dict[str, object] = dict(listing)
-        doc[URL_HASH_FIELD] = make_url_hash(listing["url"])
-        return doc
-
     def insert_many_unique(
         self, listings: Sequence[JobListing]
     ) -> tuple[int, int]:
@@ -100,7 +101,7 @@ class Storage:
             validate_listing(listing)
 
         collection = self._get_collection()
-        docs: list[dict[str, object]] = [self._add_hash(l) for l in listings]
+        docs: list[dict[str, Any]] = apply_url_hashes(listings)
 
         inserted: int = 0
         duplicates: int = 0
@@ -125,20 +126,3 @@ class Storage:
             len(listings),
         )
         return inserted, duplicates
-
-    def dedup_in_memory(
-        self, listings: Iterable[JobListing]
-    ) -> list[JobListing]:
-        seen_hashes: set[str] = set()
-        deduped: list[JobListing] = []
-        dropped = 0
-        for listing in listings:
-            url_hash = make_url_hash(listing["url"])
-            if url_hash in seen_hashes:
-                dropped += 1
-                continue
-            seen_hashes.add(url_hash)
-            deduped.append(listing)
-        if dropped:
-            log.warning("Pre-Mongo dedup dropped %d cross-source URL duplicates", dropped)
-        return deduped
