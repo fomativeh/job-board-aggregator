@@ -36,16 +36,10 @@ class ValidationError(Exception):
 
 
 def utc_now_iso() -> str:
-    # ISO-8601 UTC without timezone abbreviation; strftime gives a deterministic
-    # format so scraped_at values are sortable strings across runs.
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def make_url_hash(url: str) -> str:
-    # SHA-256 over the canonical URL string. Using a cryptographic hash here
-    # (rather than a short/fast one like xxhash) means accidental collisions
-    # across millions of URLs are statistically impossible; MongoDB index
-    # uniqueness on this field is then a correctness guarantee, not a heuristic.
     return hashlib.sha256(url.encode("utf-8")).hexdigest()
 
 
@@ -57,7 +51,6 @@ def validate_listing(listing: Union[dict[str, object], JobListing]) -> None:
     for field in REQUIRED_FIELDS:
         value = listing.get(field)
         if field in NULLABLE_FIELDS:
-            # Nullable fields accept None or the expected type, never a sentinel string.
             if value is None:
                 continue
             if not isinstance(value, str):
@@ -70,9 +63,6 @@ def validate_listing(listing: Union[dict[str, object], JobListing]) -> None:
                 f"Field '{field}' must be str, got {type(value).__name__}"
             )
         if value == "":
-            # Empty string is a different bug than missing data; fail loudly
-            # so the parser that emitted it gets fixed rather than silently
-            # polluting the dataset.
             raise ValidationError(f"Field '{field}' must be non-empty str")
 
     source_value = listing["source"]

@@ -35,8 +35,6 @@ def _require_env(key: str) -> str:
 
 
 def load_config() -> Config:
-    # Load .env silently if present; a real deploy (e.g. Docker) might pass env
-    # vars directly, so a missing .env file on disk is not an error here.
     if DOTENV_PATH.exists():
         load_dotenv(DOTENV_PATH, override=False)
         log.info("Loaded environment from %s", DOTENV_PATH)

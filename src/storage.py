@@ -38,26 +38,18 @@ class Storage:
         self._collection: Optional[Collection[Any]] = None
 
     def connect(self) -> None:
-        # Explicit timeouts prevent a hanging Python process if the MongoDB
-        # host is unreachable; the defaults (30s connect, 30s server selection)
-        # make interactive CI and local debugging painful with no upside.
         try:
             self._client = MongoClient(
                 self.config.mongo_uri,
                 connectTimeoutMS=MONGO_CONNECT_TIMEOUT_MS,
                 serverSelectionTimeoutMS=MONGO_SERVER_SELECTION_TIMEOUT_MS,
             )
-            # Force a round-trip so bad URIs or missing auth fail loudly here
-            # instead of on the first write.
             self._client.admin.command("ping")
         except OperationFailure as exc:
             raise MongoConnectionError(
                 f"MongoDB authentication/operation failed: {exc}"
             ) from exc
         except (ServerSelectionTimeoutError, NetworkTimeout, ConnectionFailure, ConfigurationError, AutoReconnect) as exc:
-            # pymongo surfaces several distinct connection-failure exception
-            # types; catching each explicitly avoids a broad except-Exception
-            # that would swallow unrelated bugs (e.g. a typo in this method).
             raise MongoConnectionError(
                 f"Could not connect to MongoDB at {self.config.mongo_uri!r}: {exc}"
             ) from exc
@@ -73,10 +65,6 @@ class Storage:
 
     def _ensure_indexes(self) -> None:
         assert self._collection is not None
-        # Unique index on url_hash is the dedup mechanism: bulk-writes that
-        # would collide on URL raise DuplicateKeyError which we convert into
-        # "skipped duplicate" accounting. A regular (non-unique) index on
-        # scraped_at keeps recent-runs queries cheap.
         self._collection.create_index(URL_HASH_FIELD, unique=True)
         self._collection.create_index("scraped_at")
         self._collection.create_index("source")
@@ -116,9 +104,6 @@ class Storage:
 
         inserted: int = 0
         duplicates: int = 0
-        # Ordered=False keeps the bulk write going past individual duplicate
-        # keys; DuplicateKeyError is raised after the bulk finishes with a
-        # list of which indexes failed, so we can still count total successes.
         try:
             result = collection.insert_many(docs, ordered=False)
             inserted = len(result.inserted_ids)
@@ -144,11 +129,6 @@ class Storage:
     def dedup_in_memory(
         self, listings: Iterable[JobListing]
     ) -> list[JobListing]:
-        # Pre-Mongo dedup pass: scrapers for different boards occasionally
-        # surface the same third-party job URL (e.g. a Greenhouse link shared
-        # by both a WeWorkRemotely ad and a Remotive ad). Collapsing those in
-        # Python before the bulk write avoids spurious DuplicateKeyError noise
-        # in logs and keeps the per-run "new vs dup" counters honest.
         seen_hashes: set[str] = set()
         deduped: list[JobListing] = []
         dropped = 0
