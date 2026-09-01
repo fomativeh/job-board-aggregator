@@ -1,0 +1,36 @@
+# ==== Python ====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+.tox/
+
+# ==== Project runtime data (never commit) ====
+.env
+session/
+output/
+tmp_fetch/
+*.sample.html
+*.sample.json
+*.sample.xml
+
+# ==== Internal workflow docs (not part of shipped repo) ====
+MILESTONES.md
+SCOPE.md
+
+# ==== OS / editor ====
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
