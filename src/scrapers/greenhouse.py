@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any, Final, Iterable, Sequence
 
 import httpx
@@ -68,14 +69,23 @@ def _location_name(job_data: dict[str, Any]) -> str:
     return "Unknown"
 
 
+_TOKEN_RE: Final[re.Pattern[str]] = re.compile(r"\w+")
+
+
+def _tokens(s: str) -> set[str]:
+    return {t.casefold() for t in _TOKEN_RE.findall(s)}
+
+
 def _matches_query(query: str, job_data: dict[str, Any], company: str) -> bool:
     if query == "":
         return True
-    needle = query.lower()
-    haystacks: list[str] = [
+    query_tokens = _tokens(query)
+    if not query_tokens:
+        return True
+    haystack_parts: list[str] = [
         str(job_data.get("title", "")),
-        company.lower(),
-        _location_name(job_data).lower(),
+        company,
+        _location_name(job_data),
     ]
     departments = job_data.get("departments")
     if isinstance(departments, list):
@@ -83,15 +93,19 @@ def _matches_query(query: str, job_data: dict[str, Any], company: str) -> bool:
             if isinstance(dep, dict):
                 name = dep.get("name")
                 if isinstance(name, str):
-                    haystacks.append(name.lower())
-    return any(needle in h for h in haystacks)
+                    haystack_parts.append(name)
+    haystack_tokens = _tokens(" ".join(haystack_parts))
+    return query_tokens.issubset(haystack_tokens)
 
 
 def _matches_location(location_filter: str, resolved_location: str) -> bool:
     if location_filter == "":
         return True
-    needle = location_filter.lower()
-    return needle in resolved_location.lower()
+    filter_tokens = _tokens(location_filter)
+    if not filter_tokens:
+        return True
+    location_tokens = _tokens(resolved_location)
+    return filter_tokens.issubset(location_tokens)
 
 
 def _normalize_job(
