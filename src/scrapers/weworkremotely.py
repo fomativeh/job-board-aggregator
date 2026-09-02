@@ -33,7 +33,7 @@ CATEGORY_SELECTOR: Final[str] = ".new-listing__categories__category"
 LINK_SELECTOR: Final[str] = "a.listing-link, a.listing-link--unlocked"
 
 SALARY_RE: Final[re.Pattern[str]] = re.compile(
-    r"(\$[\d,]+\s*[-–—]\s*\$[\d,]+\s*(?:USD|EUR|GBP)?)\b|\$[\d,]+\s*or\s+more\s*(?:USD|EUR|GBP)?"
+    r"(\$[\d,]+\s*[-–-]\s*\$[\d,]+\s*(?:USD|EUR|GBP)?)\b|\$[\d,]+\s*or\s+more\s*(?:USD|EUR|GBP)?"
 )
 HOURLY_RE: Final[re.Pattern[str]] = re.compile(r"\$[\d.]+\s*/hr\s*\+?")
 
@@ -59,7 +59,7 @@ def _pick_location(li: Tag, hq_text: str) -> str:
             break
     if not parts:
         return "Remote"
-    return " — ".join(dict.fromkeys(parts))
+    return " - ".join(dict.fromkeys(parts))
 
 
 def _pick_salary(li: Tag, hq_text: str) -> SalaryType:
@@ -164,7 +164,7 @@ async def scrape(
         return []
     if response.status_code != 200:
         log.error(
-            "WeWorkRemotely search returned status=%s query=%r — skipping parse",
+            "WeWorkRemotely search returned status=%s query=%r - skipping parse",
             response.status_code,
             query,
         )

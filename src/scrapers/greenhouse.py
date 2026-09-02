@@ -110,7 +110,7 @@ def _parse_payload(
 ) -> list[JobListing]:
     jobs_value = payload.get("jobs")
     if not isinstance(jobs_value, list):
-        log.warning("Greenhouse board %s: 'jobs' field was not a list — skipping", board_token)
+        log.warning("Greenhouse board %s: 'jobs' field was not a list - skipping", board_token)
         return []
     results: list[JobListing] = []
     for item in jobs_value:

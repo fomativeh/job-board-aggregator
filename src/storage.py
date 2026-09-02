@@ -94,14 +94,14 @@ class Storage:
         self, listings: Sequence[JobListing]
     ) -> tuple[int, int]:
         if not listings:
-            log.info("No listings provided to insert_many_unique — skipping")
+            log.info("No listings provided to insert_many_unique - skipping")
             return 0, 0
 
         for listing in listings:
             validate_listing(listing)
 
         collection = self._get_collection()
-        docs: list[dict[str, Any]] = apply_url_hashes(listings)
+        docs = apply_url_hashes(list(listings))
 
         inserted: int = 0
         duplicates: int = 0

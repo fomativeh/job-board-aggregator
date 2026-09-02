@@ -63,7 +63,7 @@ def _pick_stealth() -> _StealthPayload:
 
 
 _STEALTH_INIT: Final[str] = r"""
-// Minimal stealth boot — applied before any page script runs so headless-chrome
+// Minimal stealth boot - applied before any page script runs so headless-chrome
 // fingerprints are masked the moment Remotive's first inline <script> executes.
 (() => {
   const ua = "STEALTH_UA";
@@ -189,7 +189,7 @@ def _pick_salary(raw_salary: Any, description: Any) -> SalaryType:
         return raw_salary.strip()
     if isinstance(description, str) and description:
         m = re.search(
-            r"(\$[\d,]+\s*[-–—]\s*\$[\d,]+\s*(?:USD|EUR|GBP)?)\b"
+            r"(\$[\d,]+\s*[-–-]\s*\$[\d,]+\s*(?:USD|EUR|GBP)?)\b"
             r"|\$[\d,]+\s*(?:per year|p\.a\.|a year)",
             description,
         )
@@ -234,7 +234,7 @@ def _normalize_job(raw: dict[str, Any], query: str, location_filter: str) -> Job
 def parse_api_payload(payload: dict[str, Any], query: str, location_filter: str) -> list[JobListing]:
     jobs = payload.get("jobs")
     if not isinstance(jobs, list):
-        log.warning("Remotive API returned non-list jobs field — skipping parse")
+        log.warning("Remotive API returned non-list jobs field - skipping parse")
         return []
     results: list[JobListing] = []
     for item in jobs:
@@ -303,7 +303,7 @@ async def scrape(
                 )
             except PlaywrightTimeoutError as exc:
                 log.warning(
-                    "Remotive goto %s timed out: %s — retrying landing page",
+                    "Remotive goto %s timed out: %s - retrying landing page",
                     first_url,
                     exc,
                 )

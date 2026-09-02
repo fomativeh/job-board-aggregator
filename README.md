@@ -4,7 +4,7 @@ Scraper that pulls software-job listings from Greenhouse, WeWorkRemotely, and Re
 
 ## What It Does
 
-Runs a single CLI command to pull fresh job listings from three independent sources in parallel, normalize to a shared schema, deduplicate by URL, and persist to MongoDB. Per-run CSV/JSON export is added in the next milestone.
+Runs a single CLI command to pull fresh job listings from three independent sources in parallel, normalize to a shared schema, deduplicate by URL, persist to MongoDB, and export per-run output to CSV and JSON.
 
 Static scrapers are implemented for Greenhouse and WeWorkRemotely. Remotive uses a Playwright-based JS-rendered scraper.
 
@@ -32,15 +32,15 @@ Every listing normalizes to the same 7-field record before dedup and storage. `s
 |--------------|---------|-------|
 | `title`      | string  | `"Senior Backend Engineer, Payments"` |
 | `company`    | string  | `"Stripe"` |
-| `location`   | string  | `"Remote — EMEA"` or `"New York, NY"` |
-| `salary`     | string \| null | `"$160,000 – $210,000 USD"`; `null` when undisclosed |
+| `location`   | string  | `"Remote - EMEA"` or `"New York, NY"` |
+| `salary`     | string \| null | `"$160,000 - $210,000 USD"`; `null` when undisclosed |
 | `url`        | string  | Absolute HTTP(S) URL to the job detail page |
 | `source`     | string  | `"greenhouse"`, `"weworkremotely"`, or `"remotive"` |
 | `scraped_at` | string  | ISO-8601 UTC timestamp |
 
 ### Derived fields
 
-- **`url_hash`** — SHA-256 hex digest of `url`. Primary dedup key; a MongoDB unique index guarantees each URL is stored once. Used instead of raw URLs for fixed-length index keys and fast in-memory set lookups.
+- **`url_hash`** - SHA-256 hex digest of `url`. Primary dedup key; a MongoDB unique index guarantees each URL is stored once. Used instead of raw URLs for fixed-length index keys and fast in-memory set lookups.
 
 ### Validation
 
@@ -60,34 +60,85 @@ Both flags are optional:
 |------|------|---------|--------|
 | `--query` | string | `""` (empty) | Keyword filter applied client-side to every source's `title`, `company`, `location`, and any source-specific tags/departments. Case-insensitive substring match. Empty string pulls each source's default/latest listing set (no keyword filter). |
 | `--location` | string | `""` (empty) | Location filter applied client-side to each source's `location` column. Case-insensitive substring match. Typical values: `"Remote"`, `"New York"`, `"UK"`. Empty string disables the filter (useful when the source itself labels rows as "Remote" in a `tags` column instead of the `location` field). |
+| `--output-dir` | string | `"output"` | Directory where CSV and JSON exports are written. Created if missing. Override with `--output-dir /var/tmp/jobs` or similar for CI environments. |
 
 ### Example command and expected output
 
-Output numbers here are illustrative; real counts depend on what each source publishes on run day. The key structural log lines (INFO-level scraper counts, dedup summary, persist summary) are what to compare against.
+Output numbers here are illustrative; real counts depend on what each source publishes on run day. The key structural log lines (INFO-level scraper counts, dedup summary, persist summary, export paths) are what to compare against.
 
 ```console
 $ python -m src --query python --location Remote
-2026-09-01 14:20:31,012 INFO CLI args: query='python' location='Remote'
+2026-09-01 14:20:31,012 INFO CLI args: query='python' location='Remote' output_dir='output'
 2026-09-01 14:20:33,000 INFO Scraper greenhouse returned 31 listings
 2026-09-01 14:20:34,728 INFO Scraper weworkremotely returned 46 listings
 2026-09-01 14:20:40,418 INFO Scraper remotive returned 18 listings
 2026-09-01 14:20:40,420 INFO Pipeline raw=95 deduped=92 dropped=3
 2026-09-01 14:20:40,811 INFO Mongo persist complete: inserted=85 db_duplicates=7
-2026-09-01 14:20:40,812 INFO Pipeline complete. Final listing count returned to caller: 92
+2026-09-01 14:20:40,902 INFO CSV written: output/job_listings_20260901_142040.csv (92 rows)
+2026-09-01 14:20:40,908 INFO JSON written: output/job_listings_20260901_142040.json (92 rows)
+2026-09-01 14:20:40,909 INFO CSV  -> output/job_listings_20260901_142040.csv
+2026-09-01 14:20:40,909 INFO JSON -> output/job_listings_20260901_142040.json
+2026-09-01 14:20:40,910 INFO Pipeline complete. Final listing count returned to caller: 92
 ```
 
-Notes on the above transcript:
+## Output
 
-- `Pipeline raw=95 deduped=92 dropped=3` — 3 listings appeared on two sources (e.g. a company posts the same job to both Greenhouse and Remotive). `dropped=3` is the cross-source in-memory dedup before any DB call.
-- `inserted=85 db_duplicates=7` — MongoDB's unique `url_hash` index catches 7 URLs already persisted from a previous run. The in-memory dedup only sees *this run's* batch; DB dedup catches duplicates *across runs*.
-- "Final listing count returned to caller: 92" — exports (CSV/JSON, Milestone 6) are written from this deduped set, not the raw source set.
+Per-run export files go to `output/` (configurable with `--output-dir`). Two files per invocation:
+
+| File | Description |
+|------|-------------|
+| `job_listings_<UTC_TIMESTAMP>.csv` | Flat spreadsheet. Fixed column order. |
+| `job_listings_<UTC_TIMESTAMP>.json` | Array of JSON objects. Includes a `url_hash_verified` boolean per row. |
+
+### Directory layout
+
+```
+<repo>/
+├── output/
+│   ├── job_listings_20260901_142040.csv
+│   ├── job_listings_20260901_142040.json
+│   ├── job_listings_20260902_081102.csv
+│   └── job_listings_20260902_081102.json
+├── session/
+├── src/
+└── …
+```
+
+### CSV column order
+
+```
+title, company, location, salary, url, source, scraped_at, url_hash
+```
+
+- `salary` - blank when undisclosed. Numeric values are plain digits; range strings stay as strings.
+- `url_hash` - SHA-256 hex of `url`. Matches the dedup key stored in MongoDB.
+
+### JSON shape (one row, trimmed)
+
+```json
+[
+  {
+    "title": "Senior Engineer - Backend Platform",
+    "company": "Stripe",
+    "location": "Remote - EMEA",
+    "salary": null,
+    "url": "https://boards.greenhouse.io/stripe/jobs/5000000006",
+    "source": "greenhouse",
+    "scraped_at": "2026-09-01T14:20:33.123456+00:00",
+    "url_hash": "a1b2c3d4e5f6…",
+    "url_hash_verified": true
+  }
+]
+```
+
+`url_hash_verified` recomputes the SHA-256 inline during export and compares it to `url_hash`. Any row with `url_hash_verified: false` means hash integrity was broken between schema enrichment and export - flag to the operator before using that row downstream. Without this check a silent refactor bug in `apply_url_hashes` could cause MongoDB writes to use a different hash than the JSON file reports.
 
 Exit codes:
 
 | Code | Meaning |
 |------|---------|
 | `0` | Pipeline completed without fatal errors. |
-| `2` | Configuration error — required environment variable missing (check `.env` against `.env.example`). |
-| `3` | Network/retry failure — at least one source exceeded MAX_RETRIES on every request attempt. |
-| `4` | Remotive scraper failure — Playwright context or in-browser fetch raised. |
+| `2` | Configuration error - required environment variable missing (check `.env` against `.env.example`). |
+| `3` | Network/retry failure - at least one source exceeded MAX_RETRIES on every request attempt. |
+| `4` | Remotive scraper failure - Playwright context or in-browser fetch raised. |
 | `130` | Interrupted by user (Ctrl-C). |

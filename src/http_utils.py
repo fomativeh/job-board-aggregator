@@ -83,10 +83,10 @@ def load_cookies(source: str) -> dict[str, str]:
     try:
         data: Mapping[str, Any] = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        log.warning("Failed to read cookie jar %s: %s — starting fresh", path, exc)
+        log.warning("Failed to read cookie jar %s: %s - starting fresh", path, exc)
         return {}
     if not isinstance(data, dict):
-        log.warning("Cookie jar %s was not an object — starting fresh", path)
+        log.warning("Cookie jar %s was not an object - starting fresh", path)
         return {}
     return {k: str(v) for k, v in data.items() if isinstance(v, str)}
 
@@ -131,7 +131,7 @@ async def fetch_with_retries(
                 return response
             if 400 <= response.status_code < 500 and response.status_code not in {408, 429}:
                 log.warning(
-                    "GET %s returned %s — non-retriable client error (attempt %d/%d)",
+                    "GET %s returned %s - non-retriable client error (attempt %d/%d)",
                     url,
                     response.status_code,
                     attempt,
@@ -139,7 +139,7 @@ async def fetch_with_retries(
                 )
                 return response
             log.warning(
-                "GET %s returned %s (attempt %d/%d) — retrying after jitter",
+                "GET %s returned %s (attempt %d/%d) - retrying after jitter",
                 url,
                 response.status_code,
                 attempt,
@@ -148,7 +148,7 @@ async def fetch_with_retries(
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
             last_exc = exc
             log.warning(
-                "GET %s raised %s (attempt %d/%d) — retrying after jitter",
+                "GET %s raised %s (attempt %d/%d) - retrying after jitter",
                 url,
                 type(exc).__name__,
                 attempt,

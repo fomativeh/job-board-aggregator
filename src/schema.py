@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from datetime import datetime, timezone
-from typing import Any, Iterable, Optional, Sequence, TypedDict, Union
+from typing import Iterable, NotRequired, Optional, TypedDict, Union
 
 SalaryType = Optional[str]
 
@@ -33,6 +33,7 @@ class JobListing(TypedDict):
     url: str
     source: str
     scraped_at: str
+    url_hash: NotRequired[str]
 
 
 class ValidationError(Exception):
@@ -91,11 +92,13 @@ def validate_listing(listing: Union[dict[str, object], JobListing]) -> None:
             ) from exc
 
 
-def apply_url_hashes(listings: Sequence[JobListing]) -> list[dict[str, Any]]:
-    return [
-        {**listing, URL_HASH_FIELD: make_url_hash(listing["url"])}
-        for listing in listings
-    ]
+def apply_url_hashes(listings: list[JobListing]) -> list[JobListing]:
+    for row in listings:
+        if URL_HASH_FIELD in row:
+            continue
+        if "url" in row:
+            row["url_hash"] = make_url_hash(row["url"])
+    return listings
 
 
 def dedup_in_memory(listings: Iterable[JobListing]) -> tuple[list[JobListing], int]:
@@ -108,6 +111,7 @@ def dedup_in_memory(listings: Iterable[JobListing]) -> tuple[list[JobListing], i
             dropped += 1
             continue
         seen_hashes.add(url_hash)
+        listing["url_hash"] = url_hash
         deduped.append(listing)
     if dropped:
         log.warning("Pre-Mongo dedup dropped %d cross-source URL duplicates", dropped)

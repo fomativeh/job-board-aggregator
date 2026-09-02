@@ -11,7 +11,7 @@ def _entrypoint() -> int:
         return main()
     except KeyboardInterrupt:
         log = logging.getLogger(__name__)
-        log.warning("Interrupted by user — exiting 130")
+        log.warning("Interrupted by user - exiting 130")
         return 130
     except SystemExit:
         raise

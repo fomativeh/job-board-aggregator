@@ -7,8 +7,9 @@ import sys
 from typing import Final, Optional, Sequence
 
 from .config import MissingConfigError
+from .export import DEFAULT_OUTPUT_DIR
 from .http_utils import MaxRetriesExceeded
-from .pipeline import run_pipeline
+from .pipeline import PipelineResult, run_pipeline
 from .scrapers.remotive import RemotiveScrapeError
 
 log: logging.Logger = logging.getLogger(__name__)
@@ -18,8 +19,9 @@ DEFAULT_LOCATION: Final[str] = ""
 LOG_FORMAT: Final[str] = "%(asctime)s %(levelname)s %(message)s"
 
 DESCRIPTION: Final[str] = (
-    "Multi-Source Job Board Aggregator — scrape Greenhouse, WeWorkRemotely "
-    "and Remotive in parallel, deduplicate by URL, and persist to MongoDB."
+    "Multi-Source Job Board Aggregator - scrape Greenhouse, WeWorkRemotely "
+    "and Remotive in parallel, deduplicate by URL, persist to MongoDB, and "
+    "export per-run output to CSV + JSON."
 )
 
 EPILOG: Final[str] = (
@@ -44,6 +46,11 @@ LOCATION_HELP: Final[str] = (
     "Default: empty string (no location filter)."
 )
 
+OUTPUT_DIR_HELP: Final[str] = (
+    "Directory where CSV and JSON exports are written. Created if missing. "
+    "Default: 'output/' in the current working directory."
+)
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -64,6 +71,13 @@ def build_parser() -> argparse.ArgumentParser:
         help=LOCATION_HELP,
         type=str,
     )
+    parser.add_argument(
+        "--output-dir",
+        default=DEFAULT_OUTPUT_DIR,
+        help=OUTPUT_DIR_HELP,
+        type=str,
+        dest="output_dir",
+    )
     return parser
 
 
@@ -77,11 +91,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     query: str = args.query or DEFAULT_QUERY
     location: str = args.location or DEFAULT_LOCATION
-    log.info("CLI args: query=%r location=%r", query, location)
+    output_dir: str = args.output_dir or DEFAULT_OUTPUT_DIR
+    log.info(
+        "CLI args: query=%r location=%r output_dir=%r",
+        query,
+        location,
+        output_dir,
+    )
     try:
-        listings = asyncio.run(run_pipeline(query, location))
+        result: PipelineResult = asyncio.run(
+            run_pipeline(query, location, output_dir=output_dir)
+        )
     except KeyboardInterrupt:
-        log.warning("Interrupted by user — exiting 130")
+        log.warning("Interrupted by user - exiting 130")
         return 130
     except MissingConfigError as exc:
         log.error("Configuration error: %s", exc)
@@ -92,6 +114,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except RemotiveScrapeError as exc:
         log.error("Remotive scraper failed: %s", exc)
         return 4
+    listings = result["listings"]
+    exports = result["exports"]
+    if exports is not None:
+        log.info("CSV  -> %s", exports["csv_path"])
+        log.info("JSON -> %s", exports["json_path"])
     log.info(
         "Pipeline complete. Final listing count returned to caller: %d",
         len(listings),
