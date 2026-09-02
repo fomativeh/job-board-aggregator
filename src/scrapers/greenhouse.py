@@ -35,7 +35,26 @@ DEFAULT_BOARD_TOKENS: Final[Sequence[str]] = (
 
 
 def _pick_salary(job_data: dict[str, Any]) -> SalaryType:
-    return None
+    salary_range = job_data.get("salary_range")
+    if not isinstance(salary_range, dict):
+        return None
+    min_val = salary_range.get("min")
+    max_val = salary_range.get("max")
+    currency = salary_range.get("currency") or ""
+    if not isinstance(min_val, (int, float)) or not isinstance(max_val, (int, float)):
+        return None
+
+    def _fmt(v: int | float) -> str:
+        if isinstance(v, float) and v.is_integer():
+            v = int(v)
+        if isinstance(v, int):
+            return f"${v:,}"
+        return f"${v:,.2f}"
+
+    parts: list[str] = [f"{_fmt(min_val)} - {_fmt(max_val)}"]
+    if isinstance(currency, str) and currency:
+        parts.append(currency)
+    return " ".join(parts)
 
 
 def _location_name(job_data: dict[str, Any]) -> str:

@@ -321,6 +321,13 @@ async def scrape(
             await page.keyboard.press("PageDown")
             await page.wait_for_timeout(int(jitter() * 1000))
 
+            # We call the public JSON API from inside the warmed Playwright page
+            # (via page.evaluate) rather than a direct httpx request because as of
+            # 2026-08 Remotive returns empty/challenge-blocked responses to raw
+            # Python TLS fingerprints on some residential IPs. The in-browser call
+            # carries Chrome's TLS stack, warmed session cookie, matching Sec-CH-UA
+            # headers, and a real browser origin - the same envelope a human tab
+            # uses when their JS boot fetches jobs.
             params_obj: dict[str, Any] = {"limit": API_LIMIT_PER_SEARCH}
             if query:
                 params_obj["query"] = query
