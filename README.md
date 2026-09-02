@@ -6,20 +6,21 @@ Scraper that pulls software-job listings from Greenhouse, WeWorkRemotely, and Re
 
 Runs a single CLI command to pull fresh job listings from three independent sources in parallel, normalize to a shared schema, deduplicate by URL, persist to MongoDB, and export per-run output to CSV and JSON.
 
-Static scrapers are implemented for Greenhouse and WeWorkRemotely. Remotive uses a Playwright-based JS-rendered scraper.
+Static HTTP fetch is used for Greenhouse. WeWorkRemotely and Remotive are Playwright Chromium scrapers. WWR HTML is parsed with BeautifulSoup4 + lxml; Remotive calls its public JSON endpoint from inside the warmed browser context.
 
 ### Sources
 
 | Source | Method |
 |--------|--------|
 | **Greenhouse** | `httpx.AsyncClient` → JSON REST API. Queries 10 public board tokens per run and filters by CLI `--query`. |
-| **WeWorkRemotely** | `httpx.AsyncClient` → static HTML parsed with `BeautifulSoup4` + `lxml`. |
-| **Remotive** | async Playwright Chromium context (JS-rendered). |
+| **WeWorkRemotely** | async Playwright Chromium context (headless, stealth masks) → page HTML parsed with `BeautifulSoup4` + `lxml`. |
+| **Remotive** | async Playwright Chromium context (headless, stealth masks) → in-browser JSON fetch. |
 
 ### Fetch pipeline
 
 - All three sources run concurrently via `asyncio.gather()`.
-- Static sources share a single `httpx.AsyncClient` for connection reuse. Requests carry randomized User-Agents and Chrome-like headers, with retries on network/429/5xx failures.
+- Greenhouse uses a single `httpx.AsyncClient` with randomized User-Agents, Chrome-like headers, and retries on network/429/5xx.
+- WeWorkRemotely and Remotive each open their own Playwright Chromium context per run with stealth masks, UA spoofing, and `--disable-blink-features=AutomationControlled`.
 - Inter-request delays use `random.uniform(MIN_DELAY, MAX_DELAY)` jitter.
 - Per-source cookies persist to `session/cookies_{source}.json` and replay on subsequent runs.
 - Raw output normalizes to `JobListing` immediately after parse and validates before cross-source merging.
@@ -58,13 +59,13 @@ Both flags are optional:
 
 | Flag | Type | Default | Effect |
 |------|------|---------|--------|
-| `--query` | string | `""` (empty) | Keyword filter applied client-side to every source's `title`, `company`, `location`, and any source-specific tags/departments. Case-insensitive substring match. Empty string pulls each source's default/latest listing set (no keyword filter). |
-| `--location` | string | `""` (empty) | Location filter applied client-side to each source's `location` column. Case-insensitive substring match. Typical values: `"Remote"`, `"New York"`, `"UK"`. Empty string disables the filter (useful when the source itself labels rows as "Remote" in a `tags` column instead of the `location` field). |
-| `--output-dir` | string | `"output"` | Directory where CSV and JSON exports are written. Created if missing. Override with `--output-dir /var/tmp/jobs` or similar for CI environments. |
+| `--query` | string | `""` | Case-insensitive keyword filter on title, company, location, and tags/departments. Empty pulls the default/latest listing set from each source. |
+| `--location` | string | `""` | Case-insensitive substring match on each source's location column. Bare `--location` (no value) is shorthand for empty, skipping the filter. |
+| `--output-dir` | string | `"output"` | Directory where CSV and JSON exports go. Created if missing. |
 
 ### Example command and expected output
 
-Output numbers here are illustrative; real counts depend on what each source publishes on run day. The key structural log lines (INFO-level scraper counts, dedup summary, persist summary, export paths) are what to compare against.
+Output counts are illustrative. The key log lines are what to compare against.
 
 ```console
 $ python -m src --query python --location Remote
@@ -131,14 +132,14 @@ title, company, location, salary, url, source, scraped_at, url_hash
 ]
 ```
 
-`url_hash_verified` recomputes the SHA-256 inline during export and compares it to `url_hash`. Any row with `url_hash_verified: false` means hash integrity was broken between schema enrichment and export - flag to the operator before using that row downstream. Without this check a silent refactor bug in `apply_url_hashes` could cause MongoDB writes to use a different hash than the JSON file reports.
+`url_hash_verified` recomputes the SHA-256 inline during export and compares it to `url_hash`. False indicates hash mismatch between schema enrichment and export.
 
 Exit codes:
 
 | Code | Meaning |
 |------|---------|
 | `0` | Pipeline completed without fatal errors. |
-| `2` | Configuration error - required environment variable missing (check `.env` against `.env.example`). |
-| `3` | Network/retry failure - at least one source exceeded MAX_RETRIES on every request attempt. |
-| `4` | Remotive scraper failure - Playwright context or in-browser fetch raised. |
+| `2` | Configuration error — check `.env` against `.env.example`. |
+| `3` | At least one source exceeded MAX_RETRIES on every request attempt. |
+| `4` | Remotive scraper failure — Playwright or in-browser fetch raised. |
 | `130` | Interrupted by user (Ctrl-C). |

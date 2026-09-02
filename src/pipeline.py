@@ -48,7 +48,7 @@ async def run_all_scrapers(
     )
     async with httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=True) as client:
         gh_task: Awaitable[list[JobListing]] = greenhouse.scrape(client, query, location)
-        wwr_task: Awaitable[list[JobListing]] = weworkremotely.scrape(client, query, location)
+        wwr_task: Awaitable[list[JobListing]] = weworkremotely.scrape(query, location)
         rem_task: Awaitable[list[JobListing]] = remotive.scrape(query, location)
         results: tuple[list[JobListing], list[JobListing], list[JobListing]] = await asyncio.gather(
             gh_task, wwr_task, rem_task, return_exceptions=False
