@@ -4,9 +4,16 @@ import argparse
 import asyncio
 import logging
 import sys
+from pathlib import Path
 from typing import Final, Optional, Sequence
 
-from .config import MissingConfigError
+from .config import (
+    ALLOWED_LOG_LEVELS,
+    DEFAULT_LOG_LEVEL,
+    LOG_FORMAT,
+    MissingConfigError,
+    load_config,
+)
 from .export import DEFAULT_OUTPUT_DIR
 from .http_utils import MaxRetriesExceeded
 from .pipeline import PipelineResult, run_pipeline
@@ -16,7 +23,8 @@ log: logging.Logger = logging.getLogger(__name__)
 
 DEFAULT_QUERY: Final[str] = ""
 DEFAULT_LOCATION: Final[str] = ""
-LOG_FORMAT: Final[str] = "%(asctime)s %(levelname)s %(message)s"
+DEFAULT_LOG_LEVEL_CLI: Final[str] = ""
+DEFAULT_LOG_FILE_CLI: Final[str] = ""
 
 DESCRIPTION: Final[str] = (
     "Multi-Source Job Board Aggregator - scrape Greenhouse, WeWorkRemotely "
@@ -25,31 +33,44 @@ DESCRIPTION: Final[str] = (
 )
 
 EPILOG: Final[str] = (
-    "Both --query and --location are optional. An empty --query pulls the "
-    "default/latest listings from each source; an empty --location disables "
-    "client-side location filters (useful for 'Remote' fields that sources "
-    "already encode as a source-level keyword rather than a location column)."
+    "Both flags are optional. Empty --query pulls the latest default "
+    "listings; empty --location skips client-side location filtering."
 )
 
-QUERY_HELP: Final[str] = (
-    "Keyword filter applied client-side to each source's listings. Matches "
-    "are case-insensitive substrings against title, company, location, and "
-    "any tags/department columns a source exposes. Default: empty string "
-    "(no keyword filter)."
-)
+QUERY_HELP: Final[str] = "Case-insensitive keyword filter. Matches title, company, location, and tags. Default: none."
 
 LOCATION_HELP: Final[str] = (
-    "Location filter applied client-side to each source's location column. "
-    "Case-insensitive substring match (e.g. 'Remote', 'New York', 'UK'). "
-    "Remotive and Greenhouse return 'Remote' explicitly for remote rows; "
-    "WeWorkRemotely uses the HQ string plus a 'remote' category tag. "
-    "Default: empty string (no location filter)."
+    "Case-insensitive substring match against each source's location column "
+    "(e.g. 'Remote', 'UK'). Bare --location with no value means 'skip "
+    "location filter'. Default: none."
 )
 
-OUTPUT_DIR_HELP: Final[str] = (
-    "Directory where CSV and JSON exports are written. Created if missing. "
-    "Default: 'output/' in the current working directory."
+OUTPUT_DIR_HELP: Final[str] = "Where CSV + JSON exports go. Created if missing. Default: output/"
+
+LOG_LEVEL_HELP: Final[str] = (
+    "Minimum log level. Overrides LOG_LEVEL from .env. Values: DEBUG INFO "
+    "WARNING ERROR CRITICAL. Default: LOG_LEVEL env or INFO."
 )
+
+LOG_FILE_HELP: Final[str] = (
+    "Optional log file path (additive with console). Overrides LOG_FILE "
+    "from .env. Parent dirs are created if missing. Default: LOG_FILE env."
+)
+
+
+def _coerce_log_level(raw: str) -> str:
+    if raw == "":
+        return ""
+    candidate = raw.strip().upper()
+    if candidate in ALLOWED_LOG_LEVELS:
+        return candidate
+    log.warning(
+        "--log-level %r is not one of %s - using %s after .env is loaded",
+        raw,
+        ", ".join(sorted(ALLOWED_LOG_LEVELS)),
+        DEFAULT_LOG_LEVEL,
+    )
+    return DEFAULT_LOG_LEVEL
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -68,6 +89,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--location",
         default=DEFAULT_LOCATION,
+        const=DEFAULT_LOCATION,
+        nargs="?",
         help=LOCATION_HELP,
         type=str,
     )
@@ -78,25 +101,89 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         dest="output_dir",
     )
+    parser.add_argument(
+        "--log-level",
+        default=DEFAULT_LOG_LEVEL_CLI,
+        help=LOG_LEVEL_HELP,
+        type=str,
+        dest="log_level",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=DEFAULT_LOG_FILE_CLI,
+        help=LOG_FILE_HELP,
+        type=str,
+        dest="log_file",
+    )
     return parser
 
 
-def configure_logging() -> None:
-    logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+def _apply_log_level(level_name: str) -> None:
+    level = logging.getLevelName(level_name)
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+    for handler in root_logger.handlers:
+        handler.setLevel(level)
+
+
+def configure_logging(*, cli_log_level: str, cli_log_file: str) -> None:
+    root_logger = logging.getLogger()
+    if root_logger.handlers:
+        return
+
+    cli_ll = _coerce_log_level(cli_log_level)
+
+    formatter = logging.Formatter(LOG_FORMAT)
+
+    stream_handler = logging.StreamHandler(stream=sys.stderr)
+    stream_handler.setFormatter(formatter)
+    root_logger.addHandler(stream_handler)
+
+    try:
+        config = load_config()
+    except MissingConfigError:
+        config = None
+
+    if cli_ll != "":
+        final_level = cli_ll
+    elif config is not None:
+        final_level = config.log_level
+    else:
+        final_level = DEFAULT_LOG_LEVEL
+
+    if cli_log_file != "":
+        final_log_file: str | None = cli_log_file
+    elif config is not None:
+        final_log_file = config.log_file
+    else:
+        final_log_file = None
+
+    if final_log_file:
+        log_path = Path(final_log_file).resolve()
+        if not log_path.parent.exists():
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+        log.info("Logging to file: %s", log_path)
+
+    _apply_log_level(final_level)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    configure_logging()
     parser = build_parser()
     args = parser.parse_args(argv)
+    configure_logging(cli_log_level=args.log_level, cli_log_file=args.log_file)
     query: str = args.query or DEFAULT_QUERY
     location: str = args.location or DEFAULT_LOCATION
     output_dir: str = args.output_dir or DEFAULT_OUTPUT_DIR
     log.info(
-        "CLI args: query=%r location=%r output_dir=%r",
+        "CLI args: query=%r location=%r output_dir=%r log_level=%r log_file=%r",
         query,
         location,
         output_dir,
+        logging.getLevelName(logging.getLogger().level),
+        args.log_file or None,
     )
     try:
         result: PipelineResult = asyncio.run(
