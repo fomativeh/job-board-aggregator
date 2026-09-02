@@ -8,6 +8,7 @@ from pymongo.collection import Collection
 from pymongo.database import Database
 from pymongo.errors import (
     AutoReconnect,
+    BulkWriteError,
     ConfigurationError,
     ConnectionFailure,
     DuplicateKeyError,
@@ -32,6 +33,7 @@ __all__ = [
 
 MONGO_CONNECT_TIMEOUT_MS: int = 10_000
 MONGO_SERVER_SELECTION_TIMEOUT_MS: int = 10_000
+_DUPLICATE_KEY_CODE: int = 11000
 
 
 class MongoConnectionError(Exception):
@@ -118,6 +120,40 @@ class Storage:
                 duplicates,
                 inserted,
             )
+        except BulkWriteError as exc:
+            write_errors = exc.details.get("writeErrors", []) if exc.details else []
+            dup_indexes: set[int] = set()
+            other_errors: list[tuple[int, int, str]] = []
+            for err in write_errors:
+                raw_code = err.get("code")
+                raw_idx = err.get("index")
+                msg = str(err.get("errmsg", ""))
+                code: int = raw_code if isinstance(raw_code, int) else -1
+                idx: int = raw_idx if isinstance(raw_idx, int) else -1
+                if code == _DUPLICATE_KEY_CODE and idx >= 0:
+                    dup_indexes.add(idx)
+                else:
+                    other_errors.append((idx, code, msg))
+            nInserted: int = int(exc.details.get("nInserted", 0)) if exc.details else 0
+            if nInserted > 0:
+                inserted = nInserted
+            else:
+                inserted = max(0, len(docs) - len(dup_indexes) - len(other_errors))
+            duplicates = len(dup_indexes)
+            if other_errors:
+                log.error(
+                    "Bulk insert hit %d non-duplicate write errors; %d inserted %d duplicates_skipped sample_errors=%s",
+                    len(other_errors),
+                    inserted,
+                    duplicates,
+                    other_errors[:3],
+                )
+            else:
+                log.warning(
+                    "Bulk insert hit %d duplicate URL hashes; %d new listings inserted",
+                    duplicates,
+                    inserted,
+                )
 
         log.info(
             "insert_many_unique complete: inserted=%d duplicates_skipped=%d total_in=%d",
