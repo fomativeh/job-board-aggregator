@@ -202,6 +202,8 @@ def _normalize_job(raw: dict[str, Any], query: str, location_filter: str) -> Job
     title = raw.get("title")
     company = raw.get("company_name")
     url = raw.get("url")
+    if isinstance(url, str):
+        url = url.strip(" \t\r\n`")
     if not (isinstance(title, str) and title.strip()):
         return None
     if not (isinstance(company, str) and company.strip()):
