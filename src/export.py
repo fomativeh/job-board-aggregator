@@ -55,6 +55,12 @@ def _salary_to_csv_cell(salary: object) -> str:
     return str(salary)
 
 
+def _normalize_salary(salary: object) -> object:
+    if salary is None or isinstance(salary, (int, float)):
+        return salary
+    return str(salary)
+
+
 def _cell_value(listing: Mapping[str, object], key: str) -> object:
     value = listing.get(key)
     if key == "salary":
@@ -95,11 +101,6 @@ def write_json(
     ts = timestamp if timestamp is not None else _run_timestamp()
     json_path = out_dir / f"job_listings_{ts}.json"
     enriched = apply_url_hashes(list(listings))
-
-    def _normalize_salary(salary: object) -> object:
-        if salary is None or isinstance(salary, (int, float)):
-            return salary
-        return str(salary)
 
     normalized: list[dict[str, object]] = [
         {

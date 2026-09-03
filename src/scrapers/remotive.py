@@ -63,8 +63,8 @@ def _pick_stealth() -> _StealthPayload:
 
 
 _STEALTH_INIT: Final[str] = r"""
-// Minimal stealth boot - applied before any page script runs so headless-chrome
-// fingerprints are masked the moment Remotive's first inline <script> executes.
+// Applied before any page script runs so headless-chrome fingerprints are
+// masked the moment Remotive's first inline <script> executes.
 (() => {
   const ua = "STEALTH_UA";
   const platform = "STEALTH_PLATFORM";
@@ -103,8 +103,8 @@ _STEALTH_INIT: Final[str] = r"""
     get() { return 0; },
     configurable: true,
   });
-  // Spoof Chrome's Permissions API default so headless responses (which in
-  // Playwright default to "granted") don't trivially match a bot baseline.
+  // Headless Playwright defaults Permissions API notifications to "granted",
+  // which trivially matches a known bot baseline. Override to "default".
   if (window.Permissions && window.navigator && typeof navigator.permissions !== "undefined") {
     const orig = window.Permissions.prototype.query;
     if (orig) {
@@ -118,8 +118,8 @@ _STEALTH_INIT: Final[str] = r"""
       };
     }
   }
-  // Match Chrome's default HW_CONCURRENCY for a modern laptop rather than
-  // Playwright's default which leaks container core count.
+  // Default to 8 (modern laptop) rather than Playwright's default, which
+  // leaks the container's core count.
   Object.defineProperty(navigator, "hardwareConcurrency", {
     get() { return 8; },
     configurable: true,
@@ -323,13 +323,12 @@ async def scrape(
             await page.keyboard.press("PageDown")
             await page.wait_for_timeout(int(jitter() * 1000))
 
-            # We call the public JSON API from inside the warmed Playwright page
-            # (via page.evaluate) rather than a direct httpx request because as of
-            # 2026-08 Remotive returns empty/challenge-blocked responses to raw
-            # Python TLS fingerprints on some residential IPs. The in-browser call
-            # carries Chrome's TLS stack, warmed session cookie, matching Sec-CH-UA
-            # headers, and a real browser origin - the same envelope a human tab
-            # uses when their JS boot fetches jobs.
+            # Call the public JSON API from inside the warmed Playwright
+            # page (page.evaluate) rather than a direct httpx request. As of
+            # 2026-08 Remotive returns empty/challenge-blocked responses to
+            # raw Python TLS fingerprints on some residential IPs. The
+            # in-browser call carries Chrome's TLS stack, the warmed session
+            # cookie, matching Sec-CH-UA headers, and a real browser origin.
             params_obj: dict[str, Any] = {"limit": API_LIMIT_PER_SEARCH}
             if query:
                 params_obj["query"] = query

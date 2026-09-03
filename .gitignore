@@ -16,6 +16,9 @@ session/
 output/
 logs/
 tmp_fetch/
+.coverage
+.coverage.*
+htmlcov/
 *.sample.html
 *.sample.json
 *.sample.xml

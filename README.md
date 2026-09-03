@@ -143,3 +143,18 @@ Exit codes:
 | `3` | At least one source exceeded MAX_RETRIES on every request attempt. |
 | `4` | Remotive scraper failure — Playwright or in-browser fetch raised. |
 | `130` | Interrupted by user (Ctrl-C). |
+
+## Running tests
+
+Unit tests live under `test/` and use `pytest`. They cover URL hashing, the in-memory dedup pass, export path timestamping, and storage-layer validation paths. The storage connect test spins briefly on a bogus host so it does not require a live MongoDB instance.
+
+Globally installed third-party pytest plugins (for unrelated packages) can break imports on machines that share a system-level site-packages; the commands below disable plugin autoload so the suite is reproducible. On clean pip-installed machines you can drop the environment variables.
+
+```powershell
+$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+$env:PYTEST_ADDOPTS="-p no:cacheprovider"
+python -m pytest test/ -v -p pytest_cov
+python -m pytest test/ -v -p pytest_cov --cov=src --cov-report=term-missing
+```
+
+Configuration is in `pytest.ini`.

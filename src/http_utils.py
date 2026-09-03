@@ -12,8 +12,9 @@ import httpx
 
 log: logging.Logger = logging.getLogger(__name__)
 
-# Current desktop Chrome/Firefox UAs as of 2026-08; a fixed python-httpx or
-# single-static-UA string is on every blocklist, so we rotate per request.
+# Desktop Chrome/Firefox UAs as of 2026-08. A fixed python-httpx or
+# single-static-UA string is on every blocklist; rotating per request
+# avoids the trivial "this is a bot" fingerprint.
 USER_AGENTS: Final[list[str]] = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
@@ -21,9 +22,9 @@ USER_AGENTS: Final[list[str]] = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0",
 ]
 
-# Polite human-ish inter-request gap: stays under 1 req/s on average (the
-# "crawl-delay" convention) while random.uniform avoids the fixed-cadence
-# signature behavioral rate-limiters use to flag scrapers.
+# Human-ish inter-request gap. Stays under ~1 req/s on average (the
+# crawl-delay convention) while random.uniform avoids the fixed-cadence
+# signature behavioral rate-limiters key on for scrapers.
 MIN_DELAY: Final[float] = 0.8
 MAX_DELAY: Final[float] = 2.4
 
@@ -57,10 +58,10 @@ def build_headers(url: str, referer: Optional[str] = None) -> dict[str, str]:
     else:
         sec_fetch_site = "cross-site"
 
-    # Full Chrome-style header set: missing Accept-Language or mismatched
-    # Accept/Sec-Fetch-* headers are low-effort bot signals Cloudflare and
-    # similar WAFs score on. Bare python-httpx defaults fail this check
-    # instantly, so we mirror a real desktop tab.
+    # Chrome-style header set. Missing Accept-Language or mismatched
+    # Accept/Sec-Fetch-* headers are low-effort bot signals WAFs score on.
+    # python-httpx defaults fail this check instantly, so we mirror a
+    # real desktop tab.
     headers: dict[str, str] = {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": (

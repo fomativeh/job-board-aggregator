@@ -22,11 +22,7 @@ from .schema import URL_HASH_FIELD, JobListing, apply_url_hashes, validate_listi
 
 log: logging.Logger = logging.getLogger(__name__)
 
-# Re-exported from schema for historical callers (pipeline.py does
-# `from .storage import URL_HASH_FIELD`). Canonical definition lives in
-# schema.py as the single source of truth.
 __all__ = [
-    "URL_HASH_FIELD",
     "MongoConnectionError",
     "Storage",
 ]
