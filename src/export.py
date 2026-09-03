@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Final, Mapping, Sequence, TypedDict
 
+from .config import DEFAULT_OUTPUT_DIR
 from .schema import (
     URL_HASH_FIELD,
     JobListing,
@@ -17,7 +18,6 @@ from .schema import (
 
 log: logging.Logger = logging.getLogger(__name__)
 
-DEFAULT_OUTPUT_DIR: Final[str] = "output"
 TIMESTAMP_FORMAT: Final[str] = "%Y%m%d_%H%M%S"
 CSV_KEY_ORDER: tuple[str, ...] = (
     "title",

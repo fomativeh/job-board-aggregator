@@ -11,7 +11,16 @@ from unittest.mock import patch
 import pytest
 
 from src.cli import _coerce_log_level
-from src.config import Config, DEFAULT_LOG_LEVEL, MissingConfigError, load_config as _lc
+from src.config import (
+    Config,
+    ConfigValidationError,
+    DEFAULT_LOG_LEVEL,
+    DEFAULT_OUTPUT_DIR,
+    MissingConfigError,
+    PROJECT_ROOT,
+    is_configured,
+    load_config,
+)
 from src.http_utils import MAX_DELAY, MIN_DELAY, USER_AGENTS, build_headers, jitter
 from src.schema import (
     URL_HASH_FIELD,
@@ -263,7 +272,7 @@ def test_load_config_missing_mongo_raises(tmp_path: Path) -> None:
     try:
         with patch("src.config.DOTENV_PATH", fake_env):
             with pytest.raises(MissingConfigError):
-                _lc()
+                load_config()
     finally:
         for k, v in saved.items():
             if v is not None:
@@ -283,9 +292,133 @@ def test_load_config_log_fields_default_safely(tmp_path: Path) -> None:
     saved = {k: os.environ.pop(k, None) for k in ("MONGO_URI", "MONGO_DB", "MONGO_COLLECTION", "LOG_LEVEL", "LOG_FILE")}
     try:
         with patch("src.config.DOTENV_PATH", fake_env):
-            cfg = _lc()
+            cfg = load_config()
         assert cfg.log_level == DEFAULT_LOG_LEVEL
         assert cfg.log_file is None
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+            else:
+                os.environ.pop(k, None)
+
+
+# --- M9 config refactor: post_init validation, overrides priority, output_dir resolution, is_configured ---
+
+
+def test_config_post_init_rejects_bad_mongo_uri_scheme() -> None:
+    from pathlib import Path as _P
+    good_common: dict[str, object] = {
+        "mongo_db": "job_aggregator",
+        "mongo_collection": "job_listings",
+        "log_level": "INFO",
+        "log_file": None,
+        "output_dir": _P("output"),
+        "default_query": "",
+        "default_location": "",
+    }
+    with pytest.raises(ConfigValidationError):
+        Config(mongo_uri="http://localhost:27017", **good_common)  # type: ignore[arg-type]
+    with pytest.raises(ConfigValidationError):
+        Config(mongo_uri="ftp://localhost", **good_common)  # type: ignore[arg-type]
+    with pytest.raises(ConfigValidationError):
+        Config(mongo_uri="mongodb://localhost:27017", mongo_db="", mongo_collection="job_listings", log_level="INFO", log_file=None, output_dir=_P("o"), default_query="", default_location="")
+    with pytest.raises(ConfigValidationError):
+        Config(mongo_uri="mongodb://localhost:27017", mongo_db="x", mongo_collection="", log_level="INFO", log_file=None, output_dir=_P("o"), default_query="", default_location="")
+    with pytest.raises(ConfigValidationError):
+        Config(mongo_uri="mongodb://localhost:27017", mongo_db="x", mongo_collection="y", log_level="trace", log_file=None, output_dir=_P("o"), default_query="", default_location="")
+    ok = Config(
+        mongo_uri="mongodb+srv://user:pw@cluster0.mongodb.net/",
+        mongo_db="x", mongo_collection="y", log_level="DEBUG",
+        log_file=None, output_dir=_P("artifacts"), default_query="engineer", default_location="",
+    )
+    assert ok.mongo_uri.startswith("mongodb+srv://")
+    assert ok.log_level == "DEBUG"
+    assert ok.output_dir.is_absolute()
+
+
+def test_load_config_overrides_win_over_env_and_defaults(tmp_path: Path) -> None:
+    fake_env = tmp_path / ".env-with-log-level"
+    fake_env.write_text(
+        "MONGO_URI=mongodb://localhost:27017\n"
+        "MONGO_DB=job_aggregator\n"
+        "MONGO_COLLECTION=job_listings\n"
+        "LOG_LEVEL=WARNING\n",
+        encoding="utf-8",
+    )
+    saved = {k: os.environ.pop(k, None) for k in ("MONGO_URI", "MONGO_DB", "MONGO_COLLECTION", "LOG_LEVEL", "LOG_FILE")}
+    try:
+        cfg_env = load_config(dotenv_path=fake_env)
+        assert cfg_env.log_level == "WARNING"
+        assert cfg_env.default_query == ""
+        assert cfg_env.default_location == ""
+        assert str(cfg_env.output_dir).endswith(DEFAULT_OUTPUT_DIR.replace("/", "").replace("\\", ""))
+        cfg_over = load_config(
+            dotenv_path=fake_env,
+            log_level="DEBUG",
+            default_query="rust",
+            default_location="EU",
+            output_dir="runs",
+        )
+        assert cfg_over.log_level == "DEBUG"
+        assert cfg_over.default_query == "rust"
+        assert cfg_over.default_location == "EU"
+        assert cfg_over.output_dir.is_absolute()
+        assert cfg_over.output_dir.name == "runs"
+        assert cfg_over.mongo_uri == cfg_env.mongo_uri
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+            else:
+                os.environ.pop(k, None)
+
+
+def test_config_output_dir_resolved_absolute_relative_to_project_root(tmp_path: Path) -> None:
+    fake_env = tmp_path / ".env-mongo"
+    fake_env.write_text(
+        "MONGO_URI=mongodb://localhost:27017\n"
+        "MONGO_DB=job_aggregator\n"
+        "MONGO_COLLECTION=job_listings\n",
+        encoding="utf-8",
+    )
+    saved = {k: os.environ.pop(k, None) for k in ("MONGO_URI", "MONGO_DB", "MONGO_COLLECTION")}
+    try:
+        cfg_default = load_config(dotenv_path=fake_env)
+        assert cfg_default.output_dir.is_absolute()
+        assert cfg_default.output_dir == (PROJECT_ROOT / DEFAULT_OUTPUT_DIR).resolve()
+        cfg_artifacts = load_config(dotenv_path=fake_env, output_dir="artifacts")
+        assert cfg_artifacts.output_dir.is_absolute()
+        assert cfg_artifacts.output_dir == (PROJECT_ROOT / "artifacts").resolve()
+        abs_p = tmp_path / "elsewhere"
+        cfg_abs = load_config(dotenv_path=fake_env, output_dir=str(abs_p))
+        assert cfg_abs.output_dir.is_absolute()
+        assert cfg_abs.output_dir == abs_p.resolve()
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+            else:
+                os.environ.pop(k, None)
+
+
+def test_is_configured_semantics_with_custom_dotenv(tmp_path: Path) -> None:
+    empty = tmp_path / ".env-empty"
+    empty.write_text("", encoding="utf-8")
+    full = tmp_path / ".env-mongo"
+    full.write_text(
+        "MONGO_URI=mongodb://localhost:27017\n"
+        "MONGO_DB=job_aggregator\n"
+        "MONGO_COLLECTION=job_listings\n",
+        encoding="utf-8",
+    )
+    partial = tmp_path / ".env-partial"
+    partial.write_text("MONGO_URI=mongodb://localhost:27017\nMONGO_DB=x\n", encoding="utf-8")
+    saved = {k: os.environ.pop(k, None) for k in ("MONGO_URI", "MONGO_DB", "MONGO_COLLECTION")}
+    try:
+        assert is_configured(dotenv_path=empty) is False
+        assert is_configured(dotenv_path=partial) is False
+        assert is_configured(dotenv_path=full) is True
     finally:
         for k, v in saved.items():
             if v is not None:

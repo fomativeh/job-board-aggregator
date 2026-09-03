@@ -7,8 +7,8 @@ from typing import Awaitable, Optional, TypedDict
 
 import httpx
 
-from .config import Config, load_config
-from .export import DEFAULT_OUTPUT_DIR, RunOutput, write_both
+from .config import Config, DEFAULT_OUTPUT_DIR, load_config
+from .export import RunOutput, write_both
 from .schema import (
     JobListing,
     ValidationError,
@@ -108,9 +108,13 @@ async def run_pipeline(
         finally:
             storage.close()
     if output_dir is None:
-        output_dir = DEFAULT_OUTPUT_DIR
+        final_output_dir: str = str(loaded_config.output_dir)
+    elif isinstance(output_dir, str):
+        final_output_dir = output_dir
+    else:
+        final_output_dir = DEFAULT_OUTPUT_DIR
     try:
-        exports: RunOutput | None = write_both(deduped, output_dir)
+        exports: RunOutput | None = write_both(deduped, final_output_dir)
     except OSError as exc:
         log.error("Failed to write CSV/JSON export files: %s", exc)
         exports = None

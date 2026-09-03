@@ -9,20 +9,23 @@ from typing import Final, Optional, Sequence
 
 from .config import (
     ALLOWED_LOG_LEVELS,
+    Config,
+    ConfigValidationError,
+    DEFAULT_LOCATION,
     DEFAULT_LOG_LEVEL,
+    DEFAULT_OUTPUT_DIR,
+    DEFAULT_QUERY,
     LOG_FORMAT,
     MissingConfigError,
+    _normalise_log_level,
     load_config,
 )
-from .export import DEFAULT_OUTPUT_DIR
 from .http_utils import MaxRetriesExceeded
 from .pipeline import PipelineResult, run_pipeline
 from .scrapers.remotive import RemotiveScrapeError
 
 log: logging.Logger = logging.getLogger(__name__)
 
-DEFAULT_QUERY: Final[str] = ""
-DEFAULT_LOCATION: Final[str] = ""
 DEFAULT_LOG_LEVEL_CLI: Final[str] = ""
 DEFAULT_LOG_FILE_CLI: Final[str] = ""
 
@@ -61,16 +64,7 @@ LOG_FILE_HELP: Final[str] = (
 def _coerce_log_level(raw: str) -> str:
     if raw == "":
         return ""
-    candidate = raw.strip().upper()
-    if candidate in ALLOWED_LOG_LEVELS:
-        return candidate
-    log.warning(
-        "--log-level %r is not one of %s - using %s after .env is loaded",
-        raw,
-        ", ".join(sorted(ALLOWED_LOG_LEVELS)),
-        DEFAULT_LOG_LEVEL,
-    )
-    return DEFAULT_LOG_LEVEL
+    return _normalise_log_level(raw)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -131,8 +125,6 @@ def configure_logging(*, cli_log_level: str, cli_log_file: str) -> None:
     if root_logger.handlers:
         return
 
-    cli_ll = _coerce_log_level(cli_log_level)
-
     formatter = logging.Formatter(LOG_FORMAT)
 
     stream_handler = logging.StreamHandler(stream=sys.stderr)
@@ -140,22 +132,16 @@ def configure_logging(*, cli_log_level: str, cli_log_file: str) -> None:
     root_logger.addHandler(stream_handler)
 
     try:
-        config = load_config()
-    except MissingConfigError:
-        config = None
-
-    if cli_ll != "":
-        final_level = cli_ll
-    elif config is not None:
-        final_level = config.log_level
-    else:
+        overrides: dict[str, object] = {}
+        if cli_log_level != "":
+            overrides["log_level"] = cli_log_level
+        if cli_log_file != "":
+            overrides["log_file"] = cli_log_file
+        config = load_config(overrides=overrides) if overrides else load_config()
+        final_level: str = config.log_level
+        final_log_file: str | None = config.log_file
+    except (MissingConfigError, ConfigValidationError):
         final_level = DEFAULT_LOG_LEVEL
-
-    if cli_log_file != "":
-        final_log_file: str | None = cli_log_file
-    elif config is not None:
-        final_log_file = config.log_file
-    else:
         final_log_file = None
 
     if final_log_file:
@@ -174,26 +160,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     configure_logging(cli_log_level=args.log_level, cli_log_file=args.log_file)
-    query: str = args.query or DEFAULT_QUERY
-    location: str = args.location or DEFAULT_LOCATION
-    output_dir: str = args.output_dir or DEFAULT_OUTPUT_DIR
+    try:
+        cfg: Config = load_config(
+            log_level=args.log_level or None,
+            log_file=args.log_file or None,
+            output_dir=args.output_dir or None,
+            default_query=args.query or None,
+            default_location=args.location or None,
+        )
+    except MissingConfigError as exc:
+        log.error("Configuration error: %s", exc)
+        return 2
+    except ConfigValidationError as exc:
+        log.error("Config validation error: %s", exc)
+        return 2
+    query: str = cfg.default_query
+    location: str = cfg.default_location
     log.info(
         "CLI args: query=%r location=%r output_dir=%r log_level=%r log_file=%r",
         query,
         location,
-        output_dir,
-        logging.getLevelName(logging.getLogger().level),
-        args.log_file or None,
+        str(cfg.output_dir),
+        cfg.log_level,
+        cfg.log_file,
     )
     try:
-        result: PipelineResult = asyncio.run(
-            run_pipeline(query, location, output_dir=output_dir)
-        )
+        result: PipelineResult = asyncio.run(run_pipeline(query, location, config=cfg))
     except KeyboardInterrupt:
         log.warning("Interrupted by user - exiting 130")
         return 130
     except MissingConfigError as exc:
         log.error("Configuration error: %s", exc)
+        return 2
+    except ConfigValidationError as exc:
+        log.error("Config validation error: %s", exc)
         return 2
     except MaxRetriesExceeded as exc:
         log.error("Scrape failed: all retries exhausted. %s", exc)
