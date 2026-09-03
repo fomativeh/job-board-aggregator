@@ -328,7 +328,7 @@ def test_config_post_init_rejects_bad_mongo_uri_scheme() -> None:
     with pytest.raises(ConfigValidationError):
         Config(mongo_uri="mongodb://localhost:27017", mongo_db="x", mongo_collection="y", log_level="trace", log_file=None, output_dir=_P("o"), default_query="", default_location="")
     ok = Config(
-        mongo_uri="mongodb+srv://user:pw@cluster0.mongodb.net/",
+        mongo_uri="mongodb+srv://user:pw@example.mongodb.net/",
         mongo_db="x", mongo_collection="y", log_level="DEBUG",
         log_file=None, output_dir=_P("artifacts"), default_query="engineer", default_location="",
     )
