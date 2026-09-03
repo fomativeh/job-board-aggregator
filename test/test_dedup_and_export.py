@@ -303,7 +303,7 @@ def test_load_config_log_fields_default_safely(tmp_path: Path) -> None:
                 os.environ.pop(k, None)
 
 
-# --- M9 config refactor: post_init validation, overrides priority, output_dir resolution, is_configured ---
+# --- config: post_init validation, overrides priority, output_dir resolution, is_configured ---
 
 
 def test_config_post_init_rejects_bad_mongo_uri_scheme() -> None:
