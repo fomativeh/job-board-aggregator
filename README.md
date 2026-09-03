@@ -66,19 +66,21 @@ Both flags are optional:
 ### Example command and expected output
 
 Output counts are illustrative. The key log lines are what to compare against.
+File paths shown are relative to `<repo>/`; the actual run prints absolute,
+resolved paths (your local repo root replaces `<repo>`).
 
 ```console
 $ python -m src --query python --location Remote
-2026-09-01 14:20:31,012 INFO CLI args: query='python' location='Remote' output_dir='output'
+2026-09-01 14:20:31,012 INFO CLI args: query='python' location='Remote' output_dir='<repo>/output' log_level='INFO' log_file=None
 2026-09-01 14:20:33,000 INFO Scraper greenhouse returned 31 listings
 2026-09-01 14:20:34,728 INFO Scraper weworkremotely returned 46 listings
 2026-09-01 14:20:40,418 INFO Scraper remotive returned 18 listings
 2026-09-01 14:20:40,420 INFO Pipeline raw=95 deduped=92 dropped=3
 2026-09-01 14:20:40,811 INFO Mongo persist complete: inserted=85 db_duplicates=7
-2026-09-01 14:20:40,902 INFO CSV written: output/job_listings_20260901_142040.csv (92 rows)
-2026-09-01 14:20:40,908 INFO JSON written: output/job_listings_20260901_142040.json (92 rows)
-2026-09-01 14:20:40,909 INFO CSV  -> output/job_listings_20260901_142040.csv
-2026-09-01 14:20:40,909 INFO JSON -> output/job_listings_20260901_142040.json
+2026-09-01 14:20:40,902 INFO CSV written: <repo>/output/job_listings_20260901_142040.csv (92 rows)
+2026-09-01 14:20:40,908 INFO JSON written: <repo>/output/job_listings_20260901_142040.json (92 rows)
+2026-09-01 14:20:40,909 INFO CSV  -> <repo>/output/job_listings_20260901_142040.csv
+2026-09-01 14:20:40,909 INFO JSON -> <repo>/output/job_listings_20260901_142040.json
 2026-09-01 14:20:40,910 INFO Pipeline complete. Final listing count returned to caller: 92
 ```
 
