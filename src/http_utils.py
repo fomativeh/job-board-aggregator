@@ -45,7 +45,12 @@ def _origin(url: str) -> str:
 
 
 def build_headers(url: str, referer: Optional[str] = None) -> dict[str, str]:
-    sec_fetch_site = "none"
+    if referer is None:
+        sec_fetch_site = "none"
+    elif _origin(url) == _origin(referer):
+        sec_fetch_site = "same-origin"
+    else:
+        sec_fetch_site = "cross-site"
 
     headers: dict[str, str] = {
         "User-Agent": random.choice(USER_AGENTS),

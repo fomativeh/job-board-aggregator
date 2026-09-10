@@ -87,7 +87,7 @@ class Config:
             raise ConfigValidationError("output_dir must be a pathlib.Path")
         if not self.output_dir.is_absolute():
             object.__setattr__(
-                self, "output_dir", self.output_dir.resolve()
+                self, "output_dir", (PROJECT_ROOT / self.output_dir).resolve()
             )
         else:
             object.__setattr__(self, "output_dir", self.output_dir.resolve())
