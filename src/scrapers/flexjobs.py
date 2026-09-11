@@ -33,6 +33,7 @@ SEARCH_SETTLE_MS: Final[int] = 3500
 PAGE_WAIT_AFTER_LOAD_MS: Final[int] = 2200
 NAVIGATE_MAX_ATTEMPTS: Final[int] = 3
 MAX_PAGES: Final[int] = 60
+WIZARD_MAX_STEPS: Final[int] = 12
 
 PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent.parent.parent
 DEBUG_DIR: Final[Path] = PROJECT_ROOT / "debug" / "flexjobs"
@@ -141,6 +142,115 @@ def _results_url(query: str, location: str) -> str:
     kw = query if query else "software"
     loc = location if location else "remote"
     return START_URL_TEMPLATE.format(kw=quote_plus(kw), loc=quote_plus(loc))
+
+
+async def _maybe_escape_job_wizard(page: Page, max_steps: int = WIZARD_MAX_STEPS) -> None:
+    wiz_log = log.getChild("wizard")
+    for step in range(1, max_steps + 1):
+        current_url = page.url
+        if "/job_wizard/" not in current_url and "/jobwizard/" not in current_url.lower():
+            if step > 1:
+                wiz_log.info("FlexJobs wizard escaped after %d steps at url=%s", step - 1, current_url[:120])
+            return
+        next_sel = (
+            "a.active-btn:has-text('Next'), "
+            "a:has-text('Next'), "
+            "button:has-text('Next'), "
+            ".active-btn"
+        )
+        try:
+            next_btn = page.locator(next_sel).first
+            await next_btn.wait_for(state="visible", timeout=8000)
+        except PlaywrightTimeoutError:
+            wiz_log.warning("FlexJobs wizard step %d: no Next button visible at url=%s", step, current_url[:120])
+            await _snapshot(page, f"wizard_step{step}_no_btn")
+            return
+        try:
+            try:
+                await next_btn.click(timeout=4000)
+            except Exception:
+                await next_btn.click(force=True, timeout=4000)
+        except Exception as e:
+            wiz_log.warning("FlexJobs wizard step %d click failed: %s", step, e)
+            try:
+                await page.evaluate("""document.querySelector("a.active-btn, a:has-text('Next')")?.click()""")
+            except Exception:
+                pass
+        try:
+            await page.wait_for_function(
+                expression="oldUrl => location.href !== oldUrl",
+                arg=current_url,
+                timeout=12000,
+            )
+        except PlaywrightTimeoutError:
+            wiz_log.warning("FlexJobs wizard step %d: URL did not change after click", step)
+            await asyncio.sleep(1.0)
+    wiz_log.warning("FlexJobs wizard escape exceeded %d steps; stopping", max_steps)
+
+
+async def _dismiss_soft_reg_modal(page: Page) -> None:
+    modal_log = log.getChild("modal")
+    modal_selectors = (
+        "div[class*='sc-34eca615-0']",
+        "#soft-reg-continue-btn",
+        "div:has(> div > h2:has-text('Success! We found'))",
+    )
+    modal_found = False
+    for sel in modal_selectors:
+        try:
+            n = await page.locator(sel).first.count()
+            if n > 0:
+                modal_found = True
+                break
+        except Exception:
+            continue
+    if not modal_found:
+        return
+    try:
+        close_sel = (
+            "button[aria-label='Close'], button[aria-label='close'], "
+            "div[class*='sc-34eca615'] button:has-text('×'), "
+            "div[class*='sc-34eca615'] svg[role='img'], "
+            "div[class*='sc-34eca615'] button svg, "
+            "div[class*='sc-34eca615'] button.close"
+        )
+        close_btn = page.locator(close_sel).first
+        if await close_btn.count() > 0:
+            try:
+                await close_btn.click(timeout=3000)
+            except Exception:
+                try:
+                    await close_btn.click(force=True, timeout=3000)
+                except Exception:
+                    pass
+            await asyncio.sleep(0.6)
+    except Exception:
+        pass
+    try:
+        await page.evaluate("""
+            () => {
+                const roots = [];
+                for (const cls of ['sc-34eca615-0', 'iuDbli', 'jfHeUk']) {
+                    for (const el of document.querySelectorAll('div[class*="' + cls + '"]')) {
+                        if (el && el.parentNode) roots.push(el);
+                    }
+                }
+                const byBtn = document.getElementById('soft-reg-continue-btn');
+                if (byBtn) {
+                    let n = byBtn;
+                    for (let i = 0; i < 8 && n; i++) { n = n.parentElement; }
+                    if (n) roots.push(n);
+                }
+                for (const el of new Set(roots)) {
+                    try { el.remove(); } catch (_) {}
+                }
+                document.body.style.overflow = '';
+                document.documentElement.style.overflow = '';
+            }
+        """)
+        modal_log.info("FlexJobs soft-reg modal removed via evaluate")
+    except Exception as e:
+        modal_log.warning("FlexJobs modal evaluate-remove failed: %s", e)
 
 
 def _normalize_job(
@@ -319,6 +429,7 @@ async def _collect_results(
     except PlaywrightTimeoutError:
         nav_log.warning("Results anchor not visible after load; proceeding anyway")
     await asyncio.sleep(_jitter(SEARCH_SETTLE_MS, 1200))
+    await _dismiss_soft_reg_modal(page)
     await _snapshot(page, "step1_results_page")
     scrape_log.info("FlexJobs results URL: %s", page.url)
     batch = await _extract_cards(page, seen_card_keys, out_rows, query, scrape_log)
@@ -378,6 +489,7 @@ async def _collect_results(
         else:
             next_url = "https://www.flexjobs.com/" + next_href.lstrip("/")
         try:
+            await _dismiss_soft_reg_modal(page)
             await page.goto(next_url, wait_until="domcontentloaded", timeout=NAVIGATE_TIMEOUT_MS)
         except PlaywrightTimeoutError as e:
             nav_log.warning("Pagination page load timeout page %d: %s; break exhausted", idx, e)
@@ -387,6 +499,7 @@ async def _collect_results(
             await page.wait_for_load_state("domcontentloaded")
         except Exception:
             pass
+        await _dismiss_soft_reg_modal(page)
         await asyncio.sleep(_jitter(PAGE_WAIT_AFTER_LOAD_MS, 1400))
         prev_len = len(out_rows)
         batch = await _extract_cards(page, seen_card_keys, out_rows, query, scrape_log)
@@ -491,6 +604,8 @@ async def scrape(
                 except Exception:
                     pass
                 await asyncio.sleep(_jitter(2500, 1500))
+                await _maybe_escape_job_wizard(page)
+                await _dismiss_soft_reg_modal(page)
                 try:
                     title = (await page.title()) or ""
                     body_text = (await page.locator("body").inner_text(timeout=5000)) or ""
