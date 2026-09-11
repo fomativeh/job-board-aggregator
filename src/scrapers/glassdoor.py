@@ -190,6 +190,8 @@ def _normalize_job(
         return None
     if not _matches_query(query, title, company, location):
         return None
+    if not _matches_location(location_filter, location):
+        return None
     listing: JobListing = {
         "title": title,
         "company": company,
@@ -287,6 +289,8 @@ async def _extract_cards(
             salary = (await sal_el.inner_text()).strip() if sal_el else ""
         except Exception:
             salary = ""
+        if href and href.startswith("/"):
+            href = "https://www.glassdoor.com" + href
         if sample_logged < SAMPLE_LOG_FIRST_CARDS:
             log.debug(
                 "Glassdoor card id=%s title=%r company=%r location=%r salary=%r",
