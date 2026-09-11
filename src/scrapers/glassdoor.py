@@ -190,8 +190,6 @@ def _normalize_job(
         return None
     if not _matches_query(query, title, company, location):
         return None
-    if not _matches_location(location_filter, location):
-        return None
     listing: JobListing = {
         "title": title,
         "company": company,
@@ -217,7 +215,10 @@ async def _extract_cards(
         "ul[aria-label='Jobs List'] li[data-test='jobListing'],"
         "div[class*='JobsList_wrapper'] li[data-test='jobListing'],"
         "div.JobsList_wrapper__EyUF6 li[data-test='jobListing'],"
-        "li[data-test='jobListing']"
+        "li[data-test='jobListing'],"
+        "div.ReactModalPortal li[data-test='jobListing'],"
+        "div[data-test='job-result-card'],"
+        "article[data-test='job-card']"
     )
     try:
         cards = await page.query_selector_all(card_sel)
@@ -228,11 +229,11 @@ async def _extract_cards(
     new_added = 0
     total_cards = len(cards)
     progress_step = 5 if total_cards <= 40 else max(5, total_cards // 6)
-    title_sel = "a[data-test='job-title'], a[class*='JobCard_jobTitle'], a.JobCard_jobTitle__GLyJ1"
-    link_sel = "a[data-test='job-link'], a[class*='JobCard_trackingLink'], a.JobCard_trackingLink__HMyun"
-    company_sel = "span[class*='EmployerProfile_compactEmployerName'], span.EmployerProfile_compactEmployerName__9MGcV, span.EmployerProfile_compactEmployerName__LE242"
-    location_sel = "div[data-test='emp-location'], div[class*='JobCard_location'], div.JobCard_location__Ds1fM"
-    salary_sel = "div[data-test='detailSalary'], div[class*='JobCard_salaryEstimate'], div.JobCard_salaryEstimate__QpbTW"
+    title_sel = "a[data-test='job-title'], a[class*='JobCard_jobTitle'], a.JobCard_jobTitle__GLyJ1, h2 a, a.job-title"
+    link_sel = "a[data-test='job-link'], a[class*='JobCard_trackingLink'], a.JobCard_trackingLink__HMyun, a[href*='/partner/jobListing.htm'], a[href*='/job-listing/']"
+    company_sel = "span[class*='EmployerProfile_compactEmployerName'], span.EmployerProfile_compactEmployerName__9MGcV, span.EmployerProfile_compactEmployerName__LE242, div[data-test='employer-name'] span, span.employer-name, a[class*='CompanyNameLink'], div[class*='EmployerName']"
+    location_sel = "div[data-test='emp-location'], div[class*='JobCard_location'], div.JobCard_location__Ds1fM, span[data-test='location'], div.location, span[class*='JobCard_location']"
+    salary_sel = "div[data-test='detailSalary'], div[class*='JobCard_salaryEstimate'], div.JobCard_salaryEstimate__QpbTW, span[data-test='salary-estimate'], div.salary-estimate"
     sample_logged = 0
     for el in cards:
         total_seen += 1
@@ -292,17 +293,32 @@ async def _extract_cards(
         if href and href.startswith("/"):
             href = "https://www.glassdoor.com" + href
         if sample_logged < SAMPLE_LOG_FIRST_CARDS:
-            log.debug(
-                "Glassdoor card id=%s title=%r company=%r location=%r salary=%r",
+            log.info(
+                "Glassdoor card id=%s title=%r company=%r location=%r salary=%r href=%r",
                 job_id or href[:80],
                 title,
                 company,
                 location,
                 salary,
+                href[:100] if href else href,
             )
             sample_logged += 1
         row = _normalize_job(title, company, location, salary, href, job_id, query, location_filter)
         if row is None:
+            reasons: list[str] = []
+            if not title or not company or not href:
+                reasons.append(f"missing_field(title={bool(title)} company={bool(company)} href={bool(href)})")
+            else:
+                if not _matches_query(query, title, company, location):
+                    reasons.append(f"query_filter(query={query!r} tokens_hit={len(_tokens(query) & _tokens(f'{title} {company} {location}'))}/{len(_tokens(query))})")
+                if not _matches_location(location_filter, location):
+                    reasons.append(f"location_filter(want={location_filter!r} got={location!r})")
+            if sample_logged <= SAMPLE_LOG_FIRST_CARDS and reasons:
+                log.info(
+                    "Glassdoor card id=%s REJECTED: %s",
+                    job_id or href[:80],
+                    " AND ".join(reasons),
+                )
             if total_seen % progress_step == 0 or total_seen == total_cards:
                 log.info(
                     "Glassdoor parse progress: %d/%d cards seen, matched_post_filter_this_batch=%d, matched_after_filters_total=%d",
@@ -797,10 +813,18 @@ async def scrape(
                     else:
                         last_err = err
                         break
-                role_loc = page.locator("#searchBar-jobTitle")
-                loc_loc = page.locator("#searchBar-location")
-                role_cnt = await role_loc.count()
-                loc_cnt = await loc_loc.count()
+                try:
+                    role_cnt = await page.evaluate("() => document.querySelectorAll('#searchBar-jobTitle').length")
+                    loc_cnt = await page.evaluate("() => document.querySelectorAll('#searchBar-location').length")
+                except Exception:
+                    role_cnt = 0
+                    loc_cnt = 0
+                try:
+                    role_cnt = int(role_cnt or 0)
+                    loc_cnt = int(loc_cnt or 0)
+                except Exception:
+                    role_cnt = 0
+                    loc_cnt = 0
                 if role_cnt == 0 or loc_cnt == 0:
                     err = f"searchBar inputs missing (role={role_cnt} location={loc_cnt}) title={title_text!r}"
                     if attempt < NAVIGATE_MAX_ATTEMPTS:

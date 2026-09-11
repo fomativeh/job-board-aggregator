@@ -189,7 +189,8 @@ async def _maybe_escape_job_wizard(page: Page, *, results_url: str, max_steps: i
             return
         cards_visible = 0
         try:
-            cards_visible = await page.locator("div[data-index]").count()
+            cards_visible = await page.evaluate("() => document.querySelectorAll('div[data-index]').length")
+            cards_visible = int(cards_visible or 0)
         except Exception:
             cards_visible = 0
         if cards_visible > 0 or _on_results(current_url):
@@ -325,7 +326,9 @@ async def _dismiss_soft_reg_modal(page: Page) -> None:
     modal_found = False
     for sel in modal_selectors:
         try:
-            n = await page.locator(sel).first.count()
+            escaped = sel.replace("\\", "\\\\").replace("'", "\\'")
+            n = await page.evaluate(f"() => document.querySelectorAll('{escaped}').length")
+            n = int(n or 0)
             if n > 0:
                 modal_found = True
                 break
@@ -342,7 +345,13 @@ async def _dismiss_soft_reg_modal(page: Page) -> None:
             "div[class*='sc-34eca615'] button.close"
         )
         close_btn = page.locator(close_sel).first
-        if await close_btn.count() > 0:
+        close_exists = 0
+        try:
+            close_exists = await page.evaluate("() => document.querySelectorAll(arguments[0]).length", close_sel)
+            close_exists = int(close_exists or 0)
+        except Exception:
+            close_exists = 0
+        if close_exists > 0:
             try:
                 await close_btn.click(timeout=3000)
             except Exception:
@@ -388,6 +397,7 @@ def _normalize_job(
     url: str,
     job_id: str,
     query: str,
+    location_filter: str = "",
 ) -> Optional[JobListing]:
     title = " ".join(str(title or "").split()).strip()
     company = " ".join(str(company or "").split()).strip()
@@ -404,6 +414,18 @@ def _normalize_job(
         location = "N/A"
     if not _matches_query(query, title, company, location, salary_text):
         return None
+    if location_filter:
+        want = location_filter.strip()
+        if want and want.casefold() in REMOTE_SYNONYMS:
+            cand_low = location.casefold()
+            if not any(s in cand_low for s in REMOTE_SYNONYMS) and cand_low not in {"n/a", "any location", "multiple", ""}:
+                return None
+        elif want:
+            want_tok = _tokenize(want)
+            cand_tok = _tokenize(location)
+            if not (want_tok and (want_tok.issubset(cand_tok) or len(want_tok & cand_tok) >= max(1, len(want_tok) // 2))):
+                if want.lower() not in location.lower():
+                    return None
     listing: JobListing = {
         "title": title,
         "company": company,
@@ -423,9 +445,10 @@ async def _extract_cards(
     seen_card_keys: set[str],
     out_rows: list[JobListing],
     query: str,
+    location_filter: str,
     scrape_log: logging.Logger,
 ) -> dict[str, int]:
-    card_sel = "div[data-index]"
+    card_sel = "div[data-index], div.search-job-result, div.job-result-item, article.search-result"
     try:
         cards = await page.query_selector_all(card_sel)
     except Exception as e:
@@ -436,9 +459,10 @@ async def _extract_cards(
     new_rows = 0
     total_cards = len(cards)
     progress_step = 5 if total_cards <= 40 else max(5, total_cards // 6)
-    title_sel = "a[id^='job-name-']"
-    salary_tag_sel = "ul li"
-    loc_sel = "span.allowed-location, span[id^='allowedlocation-']"
+    title_sel = "a[id^='job-name-'], h2.job-title, a.job-title, div.job-title a, h2 a, a[class*='job-title']"
+    salary_tag_sel = "ul li, div.tag, span.salary, div.salary-info, li.tag"
+    loc_sel = "span.allowed-location, span[id^='allowedlocation-'], div.location, span.location, div[data-test='job-location'], span.job-location, div[class*='location']"
+    company_sel = "span.company, h3.company, div.company-name, span[class*='company'], a.company-link, div[data-test='company-name']"
     for el in cards:
         total_seen += 1
         try:
@@ -520,8 +544,61 @@ async def _extract_cards(
             location = ""
         if href and href.startswith("/"):
             href = "https://www.flexjobs.com" + href
-        row = _normalize_job(title, "", location, salary, href, card_uuid, query)
+        company = ""
+        try:
+            comp_el = await el.query_selector(company_sel)
+            if comp_el:
+                try:
+                    company = (await comp_el.inner_text()).strip()
+                except Exception:
+                    company = ""
+            if not company:
+                try:
+                    all_text = await el.inner_text()
+                    m = re.search(r"at ([A-Z][A-Za-z0-9&,.! ]{2,50})", all_text)
+                    if m:
+                        company = m.group(1).strip().rstrip(" ,")
+                except Exception:
+                    company = ""
+        except Exception:
+            company = ""
+        if total_seen <= SAMPLE_LOG_FIRST_CARDS:
+            scrape_log.info(
+                "FlexJobs card id=%s title=%r company=%r location=%r salary=%r href=%r",
+                card_uuid[:80],
+                title,
+                company,
+                location,
+                salary,
+                href[:100] if href else href,
+            )
+        row = _normalize_job(title, company, location, salary, href, card_uuid, query, location_filter)
         if row is None:
+            reasons: list[str] = []
+            if not title or not href:
+                reasons.append(f"missing_field(title={bool(title)} href={bool(href)})")
+            else:
+                if not _matches_query(query, title, company, location, salary):
+                    reasons.append(
+                        f"query_filter(query={query!r} tokens_hit={len(_tokenize(query) & _tokenize(f'{title} {company} {location} {salary}'))}/{len(_tokenize(query))})"
+                    )
+                if location_filter:
+                    want = location_filter.strip()
+                    cand_low = (location or "").casefold()
+                    if want.casefold() in REMOTE_SYNONYMS:
+                        if not any(s in cand_low for s in REMOTE_SYNONYMS) and cand_low not in {"n/a", "any location", "multiple", ""}:
+                            reasons.append(f"location_filter(want=Remote got={location!r})")
+                    else:
+                        wt = _tokenize(want)
+                        ct = _tokenize(location or "")
+                        if not (wt and (wt.issubset(ct) or len(wt & ct) >= max(1, len(wt) // 2))) and want.lower() not in (location or "").lower():
+                            reasons.append(f"location_filter(want={want!r} got={location!r})")
+            if total_seen <= SAMPLE_LOG_FIRST_CARDS and reasons:
+                scrape_log.info(
+                    "FlexJobs card id=%s REJECTED: %s",
+                    card_uuid[:80],
+                    " AND ".join(reasons),
+                )
             if total_seen % progress_step == 0 or total_seen == total_cards:
                 scrape_log.info(
                     "FlexJobs parse progress: %d/%d cards seen, matched_post_filter_this_batch=%d, matched_after_filters_total=%d",
@@ -559,7 +636,7 @@ async def _collect_results(
     await _dismiss_soft_reg_modal(page)
     await _snapshot(page, "step1_results_page")
     scrape_log.info("FlexJobs results URL: %s", page.url)
-    batch = await _extract_cards(page, seen_card_keys, out_rows, query, scrape_log)
+    batch = await _extract_cards(page, seen_card_keys, out_rows, query, location, scrape_log)
     nav_log.info(
         "FlexJobs initial page: seen=%d matched_post_filter_this_batch=%d matched_after_filters_total=%d kept_rows=%d cap=%s url=%s",
         batch["batch_seen"], batch["batch_matched"], len(out_rows), len(out_rows), max_listings, page.url,
@@ -629,7 +706,7 @@ async def _collect_results(
         await _dismiss_soft_reg_modal(page)
         await asyncio.sleep(_jitter(PAGE_WAIT_AFTER_LOAD_MS, 1400))
         prev_len = len(out_rows)
-        batch = await _extract_cards(page, seen_card_keys, out_rows, query, scrape_log)
+        batch = await _extract_cards(page, seen_card_keys, out_rows, query, location, scrape_log)
         new_cards = len(out_rows) - prev_len
         if new_cards == 0:
             consecutive_no_growth += 1
@@ -639,9 +716,9 @@ async def _collect_results(
             nav_log.info("FlexJobs stop condition 1: 3 consecutive pages with 0 cards parsed => pages exhausted")
             break
         nav_log.info(
-                "FlexJobs page=%d (walked %d) batch_seen=%d batch_matched_post_filter=%d new_cards=%d matched_after_filters_total=%d rows_now=%d cap=%s consec_no_growth=%d",
-                idx, pages_walked, batch["batch_seen"], batch["batch_matched"], new_cards, len(out_rows), len(out_rows), max_listings, consecutive_no_growth,
-            )
+            "FlexJobs page=%d (walked %d) batch_seen=%d batch_matched_post_filter=%d new_cards=%d matched_after_filters_total=%d rows_now=%d cap=%s consec_no_growth=%d",
+            idx, pages_walked, batch["batch_seen"], batch["batch_matched"], new_cards, len(out_rows), len(out_rows), max_listings, consecutive_no_growth,
+        )
         if target_cap and len(out_rows) >= target_cap:
             nav_log.info(
                 "FlexJobs post-filter row count %d >= target_cap %d => stop condition 3 (max-count satisfied).",
@@ -742,7 +819,11 @@ async def scrape(
                 title_low = title.lower()
                 body_low = body_text.lower()
                 wall_hits = _wall_signals(title_low, body_low)
-                cards_count = await page.locator("div[data-index]").count()
+                try:
+                    cards_count = await page.evaluate("() => document.querySelectorAll('div[data-index]').length")
+                    cards_count = int(cards_count or 0)
+                except Exception:
+                    cards_count = 0
                 nav_log.info(
                     "FlexJobs attempt %d title=%r cards=%d wall=%s resp_status=%s",
                     attempt, title[:80], cards_count, wall_hits,
