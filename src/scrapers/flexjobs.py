@@ -26,7 +26,7 @@ from ..schema import JobListing, SalaryType, make_url_hash, utc_now_iso
 log: logging.Logger = logging.getLogger(__name__)
 
 SOURCE_NAME: Final[str] = "flexjobs"
-START_URL: Final[str] = "https://www.flexjobs.com/homevariant/t9"
+START_URL_TEMPLATE: Final[str] = "https://www.flexjobs.com/search?searchkeyword={kw}&joblocations={loc}&fromHeader=true"
 NAVIGATE_TIMEOUT_MS: Final[int] = 70_000
 SCRAPER_TOTAL_TIMEOUT_SECONDS: Final[int] = 600
 SEARCH_SETTLE_MS: Final[int] = 3500
@@ -137,229 +137,10 @@ def _wall_signals(title_lowcase: str, body_text_lowcase: str) -> list[str]:
     return hits
 
 
-async def _wait_url_change(page: Page, prev_url: str, timeout_ms: int = 45000) -> bool:
-    deadline = time.monotonic() + (timeout_ms / 1000.0)
-    while time.monotonic() < deadline:
-        try:
-            cur = page.url
-            if cur != prev_url:
-                if "/search" in cur.lower() or "/jobs" in cur.lower() or "searchkeyword" in cur.lower():
-                    return True
-        except Exception:
-            pass
-        try:
-            href = await page.evaluate("() => location.href")
-            if isinstance(href, str) and href != prev_url:
-                if "/search" in href.lower() or "/jobs" in href.lower() or "searchkeyword" in href.lower():
-                    return True
-        except Exception:
-            pass
-        await asyncio.sleep(0.2)
-    return False
-
-
-async def _blacklist_wizard_links(page: Page) -> int:
-    nav_log = log.getChild("nav")
-    try:
-        count = await page.evaluate(
-            r"""() => {
-  const badHref = (el) => {
-    try {
-      const href = (el.getAttribute && el.getAttribute('href')) || '';
-      if (typeof href === 'string' && /\/job_wizard(\/|$)/i.test(href)) return true;
-    } catch {}
-    return false;
-  };
-  const badClass = (el) => {
-    try {
-      const cls = ((el && el.className && typeof el.className === 'string') ? el.className : (el.getAttribute && el.getAttribute('class')) || '').toLowerCase();
-      if (!cls) return false;
-      if (cls.includes('get_started')) return true;
-      if (cls.includes('signup-button')) return true;
-      if (cls.includes('signup_button')) return true;
-    } catch {}
-    return false;
-  };
-  const badText = (el) => {
-    try {
-      const txt = ((el.innerText || '') + ' ' + (el.textContent || '')).replace(/\s+/g,' ').trim().toLowerCase();
-      if (!txt) return false;
-      if (/^get\s*started\s*$/i.test(txt)) return true;
-      if (/find\s+your\s+(next\s+)?remote\s+job/i.test(txt)) return true;
-      if (/find\s+your\s+next\s+job/i.test(txt)) return true;
-    } catch {}
-    return false;
-  };
-  const candidates = Array.from(document.querySelectorAll('a, button, div[role="button"], span[role="button"]'));
-  let touched = 0;
-  for (const el of candidates) {
-    const hit = badHref(el) || badClass(el) || badText(el);
-    if (!hit) continue;
-    try { el.removeAttribute('href'); } catch {}
-    try {
-      if ('setAttribute' in el) {
-        el.setAttribute('href', 'javascript:void(0)');
-      }
-    } catch {}
-    try { el.removeAttribute('role'); } catch {}
-    try { el.removeAttribute('rel'); } catch {}
-    try { el.removeAttribute('data-action'); } catch {}
-    try { el.removeAttribute('onclick'); } catch {}
-    try { el.addEventListener('click', (e) => { e.stopImmediatePropagation(); e.preventDefault(); return false; }, true); } catch {}
-    try { el.addEventListener('mousedown', (e) => { e.stopImmediatePropagation(); e.preventDefault(); return false; }, true); } catch {}
-    try { el.addEventListener('mouseup', (e) => { e.stopImmediatePropagation(); e.preventDefault(); return false; }, true); } catch {}
-    try {
-      if (el.style) {
-        el.style.pointerEvents = 'none';
-        el.style.visibility = 'hidden';
-        el.style.display = 'none';
-        el.style.opacity = '0';
-      }
-    } catch {}
-    try { if ('disabled' in el) el.disabled = true; } catch {}
-    touched += 1;
-  }
-  return touched;
-}"""
-        )
-        if isinstance(count, int) and count > 0:
-            nav_log.warning(
-                "FlexJobs neutralized %d wizard-link/CTA elements (get_started / signup-button / /job_wizard href / Get Started text)",
-                count,
-            )
-        return count if isinstance(count, int) else 0
-    except Exception as e:
-        nav_log.warning("FlexJobs _blacklist_wizard_links threw %s: %s", type(e).__name__, e)
-        return 0
-
-
-async def _try_submit(page: Page, loc_input: pw_api.Locator, submit_btn: Optional[pw_api.Locator]) -> None:
-    nav_log = log.getChild("nav")
-    if submit_btn is not None:
-        used_submit: Optional[str] = None
-        try:
-            tag_ok = await page.evaluate(
-                r"""() => {
-  const b = document.getElementById('submit-search');
-  if (!b) return false;
-  return (b.tagName || '').toLowerCase() === 'button';
-}"""
-            )
-            if not bool(tag_ok):
-                nav_log.warning("submit-search element not a <button> (found %s); skipping button branch", await page.evaluate("() => { const b = document.getElementById('submit-search'); return b ? b.tagName : null; }"))
-            else:
-                try:
-                    visible = await submit_btn.is_visible(timeout=2500)
-                except Exception:
-                    visible = False
-                if visible:
-                    try:
-                        await submit_btn.click(force=True, timeout=6000)
-                        used_submit = "btn-click-force"
-                    except Exception:
-                        try:
-                            rv = await page.evaluate(
-                                r"""() => {
-  const b = document.getElementById('submit-search');
-  if (!b) return null;
-  if ((b.tagName || '').toLowerCase() !== 'button') return null;
-  const evt = new MouseEvent('click', {bubbles:true, cancelable:true, view: window, button:0});
-  b.dispatchEvent(evt);
-  try { b.click(); } catch {}
-  return 'btn-js-mouse-click';
-}"""
-                            )
-                            if isinstance(rv, str):
-                                used_submit = rv
-                        except Exception:
-                            pass
-        except Exception:
-            pass
-        if used_submit is None:
-            try:
-                rv = await page.evaluate(
-                    r"""() => {
-  const b = document.getElementById('submit-search');
-  if (!b) return null;
-  if ((b.tagName || '').toLowerCase() !== 'button') return null;
-  const evt = new MouseEvent('click', {bubbles:true, cancelable:true, view: window, button:0});
-  b.dispatchEvent(evt);
-  try { b.click(); } catch {}
-  return 'btn-js-mouse-click-no-visibility';
-}"""
-                )
-                if isinstance(rv, str):
-                    used_submit = rv
-            except Exception:
-                pass
-        if used_submit is not None:
-            nav_log.info("FlexJobs submit used %s", used_submit)
-            return
-    loc_tag_ok = False
-    try:
-        loc_tag_ok = bool(await page.evaluate(
-            r"""() => {
-  const inp = document.getElementById('search-by-location');
-  return inp && (inp.tagName || '').toLowerCase() === 'input';
-}"""
-        ))
-    except Exception:
-        loc_tag_ok = False
-    if loc_tag_ok:
-        try:
-            await loc_input.focus(timeout=3000)
-            await asyncio.sleep(_jitter(250, 150))
-            await loc_input.press("Enter")
-            nav_log.info("FlexJobs submit used loc_input.Enter (id=search-by-location INPUT)")
-            return
-        except Exception:
-            pass
-    raise FlexJobsScrapeError("Failed to submit search form")
-
-
-async def _maybe_handle_job_wizard(
-    page: Page,
-    query: str,
-    location_filter: str,
-    *,
-    skip_3rd_click: bool = True,
-) -> bool:
-    nav_log = log.getChild("nav")
-    url_low = (page.url or "").lower()
-    if "/job_wizard/" not in url_low and "why_remote" not in url_low:
-        return False
-    nav_log.warning(
-        "Detected FlexJobs job_wizard page (%s). Skipping ALL overlay interactions, direct /search fallback only.",
-        page.url,
-    )
-    try:
-        await page.wait_for_load_state("domcontentloaded")
-    except Exception:
-        pass
-    title_sel_val: str = query or ""
-    try:
-        maybe_val = await page.locator("input#search-by-param").input_value(timeout=1500)
-        if maybe_val and isinstance(maybe_val, str) and maybe_val.strip():
-            title_sel_val = maybe_val.strip()
-    except Exception:
-        pass
-    direct = (
-        "https://www.flexjobs.com/search?searchkeyword="
-        + quote_plus(title_sel_val or "software")
-        + "&joblocations="
-        + quote_plus(location_filter or "remote")
-        + "&usecLocation=true&Loc.LatLng=0%2C0&Loc.Radius=30&sortbyposteddate=true&fromHeader=true"
-    )
-    try:
-        await page.goto(direct, wait_until="domcontentloaded", timeout=NAVIGATE_TIMEOUT_MS)
-        try:
-            await page.wait_for_load_state("domcontentloaded")
-        except Exception:
-            pass
-        await _blacklist_wizard_links(page)
-    except PlaywrightTimeoutError:
-        pass
-    return True
+def _results_url(query: str, location: str) -> str:
+    kw = query if query else "software"
+    loc = location if location else "remote"
+    return START_URL_TEMPLATE.format(kw=quote_plus(kw), loc=quote_plus(loc))
 
 
 def _normalize_job(
@@ -521,7 +302,7 @@ async def _extract_cards(
     return {"batch_seen": total_seen, "batch_matched": matched_kept, "batch_new_rows": new_rows}
 
 
-async def _search_and_collect(
+async def _collect_results(
     page: Page,
     query: str,
     location: str,
@@ -532,269 +313,28 @@ async def _search_and_collect(
     out_rows: list[JobListing] = []
     seen_card_keys: set[str] = set()
     target_cap = max_listings
-    initial_url = START_URL
-
-    kw_loc = page.locator("input#search-by-param")
-    loc_loc = page.locator("input#search-by-location")
-    submit_btn = page.locator("button#submit-search")
-
-    current_url_low = (page.url or "").lower()
-    if "/job_wizard/" in current_url_low or "why_remote" in current_url_low:
-        nav_log.warning(
-            "Page already on wizard %s before any fill; direct /search fallback NOW.",
-            page.url,
-        )
-        await _maybe_handle_job_wizard(page, query, location, skip_3rd_click=True)
-
-    async def _set_value_only(placeholder_contains: str, id_sel: str, value: str, label: str) -> str:
-        async with asyncio.timeout(10):
-            used = await page.evaluate(
-                r"""([p, idSel, val]) => {
-  const lc = (p || '').toLowerCase();
-  const inputs = Array.from(document.querySelectorAll('input'));
-  let target = null;
-  for (const inp of inputs) {
-    const ph = (inp.getAttribute('placeholder') || '').toLowerCase();
-    const id = (inp.id || '').toLowerCase();
-    if (lc && ph.indexOf(lc) >= 0 && inp.offsetParent !== null) { target = inp; break; }
-  }
-  if (!target) {
-    for (const inp of inputs) {
-      const id = (inp.id || '').toLowerCase();
-      if (idSel && id === idSel.toLowerCase() && inp.offsetParent !== null) { target = inp; break; }
-    }
-  }
-  if (!target) { target = inputs[0] || null; }
-  if (!target) return 'no-inputs-found';
-  target.value = val;
-  return { 'target.id': target.id, 'placeholder': target.getAttribute('placeholder'), 'type': target.type, 'value': target.value };
-}""",
-                [placeholder_contains, id_sel, value],
-            )
-            nav_log.info("FlexJobs %s field set (value only, no focus / no events): %s", label, used)
-            if isinstance(used, dict) and isinstance(used.get("target.id"), str):
-                return used["target.id"]
-            return ""
-
-    async def _fill_field_with_events(placeholder_contains: str, id_sel: str, value: str, label: str) -> str:
-        async with asyncio.timeout(10):
-            used = await page.evaluate(
-                r"""([p, idSel, val]) => {
-  const lc = (p || '').toLowerCase();
-  const inputs = Array.from(document.querySelectorAll('input'));
-  let target = null;
-  for (const inp of inputs) {
-    const ph = (inp.getAttribute('placeholder') || '').toLowerCase();
-    const id = (inp.id || '').toLowerCase();
-    if (lc && ph.indexOf(lc) >= 0 && inp.offsetParent !== null) { target = inp; break; }
-  }
-  if (!target) {
-    for (const inp of inputs) {
-      const id = (inp.id || '').toLowerCase();
-      if (idSel && id === idSel.toLowerCase() && inp.offsetParent !== null) { target = inp; break; }
-    }
-  }
-  if (!target) { target = inputs[0] || null; }
-  if (!target) return 'no-inputs-found';
-  try { target.focus({preventScroll: true}); } catch {}
-  target.value = val;
-  target.dispatchEvent(new Event('input', {bubbles:true, cancelable:true}));
-  target.dispatchEvent(new Event('change', {bubbles:true, cancelable:true}));
-  return { 'target.id': target.id, 'placeholder': target.getAttribute('placeholder'), 'type': target.type, 'value': target.value };
-}""",
-                [placeholder_contains, id_sel, value],
-            )
-            nav_log.info("FlexJobs %s field assigned (with input/change events): %s", label, used)
-            if isinstance(used, dict) and isinstance(used.get("target.id"), str):
-                return used["target.id"]
-            return ""
-
-    async def _focus_field(id_sel: str, placeholder_contains: str) -> bool:
-        async with asyncio.timeout(8):
-            ok = await page.evaluate(
-                r"""([idSel, phText]) => {
-  const idLower = (idSel || '').toLowerCase();
-  const phLower = (phText || '').toLowerCase();
-  const inputs = Array.from(document.querySelectorAll('input'));
-  let target = null;
-  if (idLower) {
-    for (const inp of inputs) {
-      const id = (inp.id || '').toLowerCase();
-      if (id === idLower && inp.offsetParent !== null) { target = inp; break; }
-    }
-  }
-  if (!target && phLower) {
-    for (const inp of inputs) {
-      const ph = (inp.getAttribute('placeholder') || '').toLowerCase();
-      if (ph.indexOf(phLower) >= 0 && inp.offsetParent !== null) { target = inp; break; }
-    }
-  }
-  if (!target) return false;
-  try { target.focus({preventScroll: false}); } catch { return false; }
-  return true;
-}""",
-                [id_sel, placeholder_contains],
-            )
-            return bool(ok)
-
-    try:
-        await _set_value_only("Search by job title", "search-by-param", query, "keyword")
-    except Exception as e:
-        try:
-            async with asyncio.timeout(8):
-                fallback_id = await page.evaluate(
-                    [r"""([q]) => {
-  const inputs = Array.from(document.querySelectorAll('input'));
-  let target = null;
-  for (const inp of inputs) {
-    const ph = (inp.getAttribute('placeholder') || '').toLowerCase();
-    const id = (inp.id || '').toLowerCase();
-    if (ph.indexOf('search by job title') >= 0 && inp.offsetParent !== null) { target = inp; break; }
-  }
-  if (!target) {
-    for (const inp of inputs) {
-      const id = (inp.id || '').toLowerCase();
-      if (id === 'search-by-param' && inp.offsetParent !== null) { target = inp; break; }
-    }
-  }
-  if (!target) target = inputs[0] || null;
-  if (!target) return null;
-  target.value = q;
-  return target.id || '';
-}""", [query]],
-                )
-                if not isinstance(fallback_id, str) or not fallback_id:
-                    raise FlexJobsScrapeError(f"Keyword fallback no-inputs: primary={e}")
-        except FlexJobsScrapeError:
-            raise
-        except Exception as e2:
-            raise FlexJobsScrapeError(f"Failed to set keyword field value: primary={e} fallback={e2}")
-
-    try:
-        focused = await _focus_field("search-by-location", "Search by location")
-        if not focused:
-            try:
-                await loc_loc.focus(timeout=3000)
-            except Exception:
-                pass
-    except Exception:
-        try:
-            await loc_loc.focus(timeout=3000)
-        except Exception:
-            pass
-
-    await asyncio.sleep(_jitter(200, 200))
-    try:
-        await _fill_field_with_events("Search by location", "search-by-location", location, "location")
-    except Exception as e:
-        try:
-            async with asyncio.timeout(8):
-                filled_ok = await page.evaluate(
-                    [r"""([loc]) => {
-  const inputs = Array.from(document.querySelectorAll('input'));
-  let target = null;
-  for (const inp of inputs) {
-    const id = (inp.id || '').toLowerCase();
-    if (id === 'search-by-location' && inp.offsetParent !== null) { target = inp; break; }
-  }
-  if (!target) {
-    for (const inp of inputs) {
-      const ph = (inp.getAttribute('placeholder') || '').toLowerCase();
-      if (ph.indexOf('search by location') >= 0 && inp.offsetParent !== null) { target = inp; break; }
-    }
-  }
-  if (!target) return false;
-  if ((target.tagName || '').toLowerCase() !== 'input') return false;
-  try { target.focus({preventScroll: true}); } catch {}
-  target.value = loc;
-  target.dispatchEvent(new Event('input', {bubbles:true, cancelable:true}));
-  target.dispatchEvent(new Event('change', {bubbles:true, cancelable:true}));
-  return true;
-}""", [location]],
-                )
-                if not bool(filled_ok):
-                    raise FlexJobsScrapeError(f"Failed to fill location field: primary={e} fallback=no valid <input id=search-by-location>")
-        except FlexJobsScrapeError:
-            raise
-        except Exception as e2:
-            raise FlexJobsScrapeError(f"Failed to fill location field: primary={e} fallback={e2}")
-
-    prev_url = page.url
-    try:
-        async with asyncio.timeout(12):
-            await _try_submit(page, loc_loc, submit_btn)
-    except FlexJobsScrapeError:
-        raise
-    except Exception as e:
-        raise FlexJobsScrapeError(f"Submit block exceeded timeout: {e}")
-
-    changed = await _wait_url_change(page, prev_url, timeout_ms=50000)
-    if not changed:
-        nav_log.warning("First submit did not change URL; retrying submit once more after extra 3s settle")
-        await asyncio.sleep(3.0)
-        try:
-            await _try_submit(page, loc_loc, submit_btn)
-        except FlexJobsScrapeError:
-            pass
-        changed = await _wait_url_change(page, prev_url, timeout_ms=35000)
-    await _maybe_handle_job_wizard(page, query, location, skip_3rd_click=True)
     try:
         results_anchor = page.locator("div[data-index], #search-pagination")
         await results_anchor.first.wait_for(state="attached", timeout=40_000)
     except PlaywrightTimeoutError:
-        nav_log.warning("Results anchor not visible after submit; proceeding anyway")
+        nav_log.warning("Results anchor not visible after load; proceeding anyway")
     await asyncio.sleep(_jitter(SEARCH_SETTLE_MS, 1200))
-    await _snapshot(page, "step1_after_submit")
-    scrape_log.info("FlexJobs after submit URL: %s", page.url)
-    still_on_index = (page.url.rstrip("/") == initial_url.rstrip("/"))
-
+    await _snapshot(page, "step1_results_page")
+    scrape_log.info("FlexJobs results URL: %s", page.url)
     batch = await _extract_cards(page, seen_card_keys, out_rows, query, scrape_log)
-    initial_cards = batch["batch_seen"]
-    if "/job_wizard/" in page.url.lower() or "why_remote" in page.url.lower():
-        nav_log.warning("Still on job wizard after initial parse; handle again")
-        await _maybe_handle_job_wizard(page, query, location, skip_3rd_click=True)
-        batch = await _extract_cards(page, seen_card_keys, out_rows, query, scrape_log)
-        initial_cards = batch["batch_seen"]
-    if still_on_index and initial_cards == 0:
-        nav_log.warning("Still on index page, 0 cards; extra settle + reparse")
-        await asyncio.sleep(_jitter(5000, 4000))
-        try:
-            results_loc = page.locator("div[data-index]")
-            await results_loc.first.wait_for(state="attached", timeout=20_000)
-        except PlaywrightTimeoutError:
-            pass
-        batch = await _extract_cards(page, seen_card_keys, out_rows, query, scrape_log)
-        if batch["batch_seen"] == 0:
-            scrape_log.warning("2 attempts, 0 cards; re-submit via submit-search button + wait")
-            try:
-                await _blacklist_wizard_links(page)
-                try:
-                    async with asyncio.timeout(10):
-                        await _try_submit(page, loc_loc, submit_btn)
-                except Exception:
-                    pass
-                await _wait_url_change(page, page.url, timeout_ms=30000)
-                await asyncio.sleep(_jitter(4500, 2000))
-                batch = await _extract_cards(page, seen_card_keys, out_rows, query, scrape_log)
-            except Exception:
-                pass
-
     nav_log.info(
         "FlexJobs initial page: seen=%d matched_post_filter_this_batch=%d matched_after_filters_total=%d kept_rows=%d cap=%s url=%s",
         batch["batch_seen"], batch["batch_matched"], len(out_rows), len(out_rows), max_listings, page.url,
     )
-
     if target_cap and len(out_rows) >= target_cap:
         nav_log.info(
             "FlexJobs post-filter row count %d >= target_cap %d => stop condition 3 (max-count satisfied).",
             len(out_rows), target_cap,
         )
         return out_rows
-
     consecutive_no_growth = 0
     pages_walked = 1
     total_start = time.monotonic()
-
     for idx in range(2, MAX_PAGES + 2):
         if time.monotonic() - total_start > SCRAPER_TOTAL_TIMEOUT_SECONDS:
             nav_log.info("FlexJobs stop condition 2: total timeout %ds reached", SCRAPER_TOTAL_TIMEOUT_SECONDS)
@@ -826,23 +366,17 @@ async def _search_and_collect(
                     next_href = None
         except Exception:
             next_href = None
-
         if not next_href:
-            if consecutive_no_growth >= 3:
-                nav_log.info(
-                    "FlexJobs stop condition 1: next link absent/disabled AND 3 consecutive 0-new-cards => pages exhausted"
-                )
-                break
-            nav_log.info("FlexJobs next link absent/disabled; checking 3-consecutive threshold (consec_no_growth=%d)", consecutive_no_growth)
+            nav_log.info(
+                "FlexJobs stop condition 1: next link absent/disabled => pages exhausted"
+            )
             break
-
         if next_href.startswith("/"):
             next_url = "https://www.flexjobs.com" + next_href
         elif next_href.startswith("http"):
             next_url = next_href
         else:
             next_url = "https://www.flexjobs.com/" + next_href.lstrip("/")
-
         try:
             await page.goto(next_url, wait_until="domcontentloaded", timeout=NAVIGATE_TIMEOUT_MS)
         except PlaywrightTimeoutError as e:
@@ -853,7 +387,6 @@ async def _search_and_collect(
             await page.wait_for_load_state("domcontentloaded")
         except Exception:
             pass
-        await _blacklist_wizard_links(page)
         await asyncio.sleep(_jitter(PAGE_WAIT_AFTER_LOAD_MS, 1400))
         prev_len = len(out_rows)
         batch = await _extract_cards(page, seen_card_keys, out_rows, query, scrape_log)
@@ -875,7 +408,6 @@ async def _search_and_collect(
                 len(out_rows), target_cap,
             )
             break
-
     return out_rows
 
 
@@ -908,13 +440,13 @@ async def scrape(
     nav_log = log.getChild("nav")
     collected: list[JobListing] = []
     last_err: Optional[Exception] = None
+    results_url = _results_url(query, location)
     try:
         if not external_pw:
             playwright = await async_playwright().start()
         assert playwright is not None
-
         for attempt in range(1, NAVIGATE_MAX_ATTEMPTS + 1):
-            nav_log.info("FlexJobs open attempt %d/%d start URL=%s", attempt, NAVIGATE_MAX_ATTEMPTS, START_URL)
+            nav_log.info("FlexJobs open attempt %d/%d results URL=%s", attempt, NAVIGATE_MAX_ATTEMPTS, results_url)
             browser: Optional[Browser] = None
             ctx: Optional[BrowserContext] = None
             page: Optional[Page] = None
@@ -928,9 +460,8 @@ async def scrape(
                     page = ctx.pages[0] if ctx.pages else await ctx.new_page()
                 except Exception:
                     page = await ctx.new_page()
-
                 try:
-                    resp = await page.goto(START_URL, wait_until="domcontentloaded", timeout=NAVIGATE_TIMEOUT_MS)
+                    resp = await page.goto(results_url, wait_until="domcontentloaded", timeout=NAVIGATE_TIMEOUT_MS)
                 except PlaywrightTimeoutError as e:
                     last_err = e
                     nav_log.warning("FlexJobs goto attempt %d timeout: %s", attempt, e)
@@ -959,7 +490,6 @@ async def scrape(
                     await page.wait_for_load_state("domcontentloaded")
                 except Exception:
                     pass
-                await _blacklist_wizard_links(page)
                 await asyncio.sleep(_jitter(2500, 1500))
                 try:
                     title = (await page.title()) or ""
@@ -970,12 +500,10 @@ async def scrape(
                 title_low = title.lower()
                 body_low = body_text.lower()
                 wall_hits = _wall_signals(title_low, body_low)
-                kw_count = await page.locator("input#search-by-param").count()
-                loc_count = await page.locator("input#search-by-location").count()
-                btn_count = await page.locator("button#submit-search").count()
+                cards_count = await page.locator("div[data-index]").count()
                 nav_log.info(
-                    "FlexJobs attempt %d title=%r kw_inputs=%d loc_inputs=%d submit_btns=%d wall=%s resp_status=%s",
-                    attempt, title[:80], kw_count, loc_count, btn_count, wall_hits,
+                    "FlexJobs attempt %d title=%r cards=%d wall=%s resp_status=%s",
+                    attempt, title[:80], cards_count, wall_hits,
                     resp.status if resp else "n/a",
                 )
                 if wall_hits:
@@ -991,22 +519,8 @@ async def scrape(
                     browser = None
                     await asyncio.sleep(3.0 * attempt)
                     continue
-                if kw_count < 1 or loc_count < 1:
-                    nav_log.warning("FlexJobs attempt %d missing kw/loc inputs; bad page; retry", attempt)
-                    last_err = FlexJobsScrapeError(f"Bad load: kw={kw_count} loc={loc_count}")
-                    await _snapshot(page, f"attempt{attempt}_bad_load")
-                    try:
-                        await ctx.close()
-                        await browser.close()
-                    except Exception:
-                        pass
-                    ctx = None
-                    browser = None
-                    await asyncio.sleep(2.0 * attempt)
-                    continue
                 await _snapshot(page, f"attempt{attempt}_initial_load")
-
-                rows = await _search_and_collect(page, query, location, max_listings)
+                rows = await _collect_results(page, query, location, max_listings)
                 collected.extend(rows)
                 await _snapshot(page, "final")
                 break
