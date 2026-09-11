@@ -144,48 +144,175 @@ def _results_url(query: str, location: str) -> str:
     return START_URL_TEMPLATE.format(kw=quote_plus(kw), loc=quote_plus(loc))
 
 
-async def _maybe_escape_job_wizard(page: Page, max_steps: int = WIZARD_MAX_STEPS) -> None:
+async def _prime_user_interaction(page: Page) -> None:
+    try:
+        vw = VIEWPORT["width"]
+        vh = VIEWPORT["height"]
+        for _ in range(3):
+            x = random.randint(100, vw - 100)
+            y = random.randint(100, vh - 150)
+            await page.mouse.move(x, y, steps=random.randint(3, 7))
+            await asyncio.sleep(random.uniform(0.05, 0.15))
+        await page.mouse.move(vw // 2, vh // 2)
+        await page.mouse.down()
+        await asyncio.sleep(random.uniform(0.05, 0.1))
+        await page.mouse.up()
+        await page.mouse.wheel(delta_x=0, delta_y=random.randint(80, 220))
+        await asyncio.sleep(0.25)
+    except Exception:
+        pass
+
+
+async def _maybe_escape_job_wizard(page: Page, *, results_url: str, max_steps: int = WIZARD_MAX_STEPS) -> None:
     wiz_log = log.getChild("wizard")
+
+    def _on_wizard(url: str) -> bool:
+        return "/job_wizard/" in url or "/jobwizard/" in url.lower()
+
+    def _on_results(url: str) -> bool:
+        return "/search" in url or "/jobs" in url.lower()
+
+    if not _on_wizard(page.url):
+        return
+
+    try:
+        await _prime_user_interaction(page)
+    except Exception:
+        pass
+
+    renavigated = False
     for step in range(1, max_steps + 1):
         current_url = page.url
-        if "/job_wizard/" not in current_url and "/jobwizard/" not in current_url.lower():
-            if step > 1:
+        if not _on_wizard(current_url):
+            if step > 1 or renavigated:
                 wiz_log.info("FlexJobs wizard escaped after %d steps at url=%s", step - 1, current_url[:120])
             return
-        next_sel = (
-            "a.active-btn:has-text('Next'), "
-            "a:has-text('Next'), "
-            "button:has-text('Next'), "
-            ".active-btn"
-        )
+        cards_visible = 0
         try:
-            next_btn = page.locator(next_sel).first
-            await next_btn.wait_for(state="visible", timeout=8000)
-        except PlaywrightTimeoutError:
-            wiz_log.warning("FlexJobs wizard step %d: no Next button visible at url=%s", step, current_url[:120])
-            await _snapshot(page, f"wizard_step{step}_no_btn")
+            cards_visible = await page.locator("div[data-index]").count()
+        except Exception:
+            cards_visible = 0
+        if cards_visible > 0 or _on_results(current_url):
+            wiz_log.info("FlexJobs wizard: results DOM present at url=%s; treating escape done", current_url[:120])
             return
-        try:
+
+        if step == 2 and not renavigated:
+            wiz_log.info("FlexJobs wizard step 2: re-navigate to results URL with cookie state")
+            renavigated = True
             try:
-                await next_btn.click(timeout=4000)
-            except Exception:
-                await next_btn.click(force=True, timeout=4000)
-        except Exception as e:
-            wiz_log.warning("FlexJobs wizard step %d click failed: %s", step, e)
+                await page.goto(
+                    results_url,
+                    wait_until="domcontentloaded",
+                    timeout=NAVIGATE_TIMEOUT_MS,
+                    referer="https://www.flexjobs.com/",
+                )
+            except PlaywrightTimeoutError:
+                pass
+            except Exception as e:
+                wiz_log.warning("FlexJobs wizard re-nav failed: %s", e)
             try:
-                await page.evaluate("""document.querySelector("a.active-btn, a:has-text('Next')")?.click()""")
+                await page.wait_for_load_state("domcontentloaded")
             except Exception:
                 pass
+            await asyncio.sleep(_jitter(2200, 1000))
+            if not _on_wizard(page.url):
+                wiz_log.info("FlexJobs wizard escaped via re-navigate; url=%s", page.url[:120])
+                return
+            continue
+
+        next_sel = (
+            "a:has-text('Next'), "
+            "button:has-text('Next'), "
+            "a.active-btn, "
+            ".active-btn"
+        )
+        btn_attached = False
+        try:
+            next_btn = page.locator(next_sel).first
+            await next_btn.wait_for(state="attached", timeout=8000)
+            btn_attached = True
+        except PlaywrightTimeoutError:
+            btn_attached = False
+
+        if not btn_attached:
+            if step >= max_steps - 2:
+                wiz_log.warning("FlexJobs wizard step %d: Next not attached; forcing location.href", step)
+                try:
+                    await page.evaluate(f"window.location.href = {results_url!r};")
+                except Exception:
+                    pass
+                await asyncio.sleep(_jitter(3000, 800))
+                continue
+            wiz_log.warning("FlexJobs wizard step %d: Next not attached at url=%s; retrying after primer", step, current_url[:120])
+            try:
+                await _prime_user_interaction(page)
+            except Exception:
+                pass
+            await asyncio.sleep(0.8)
+            continue
+
+        clicked = False
+        try:
+            try:
+                await next_btn.click(force=True, timeout=4000)
+                clicked = True
+            except Exception:
+                pass
+        except Exception:
+            pass
+        if not clicked:
+            try:
+                n = await page.evaluate("""
+                    () => {
+                        const nodes = Array.from(document.querySelectorAll('a, button'));
+                        const el = nodes.find(n => /\\bNext\\b/i.test(n.textContent || ''));
+                        if (el) { el.click(); return true; }
+                        const act = document.querySelector('a.active-btn, .active-btn');
+                        if (act) { act.click(); return true; }
+                        return false;
+                    }
+                """)
+                if n:
+                    clicked = True
+                    wiz_log.info("FlexJobs wizard step %d: Next clicked via evaluate()", step)
+            except Exception as e:
+                wiz_log.warning("FlexJobs wizard step %d evaluate click failed: %s", step, e)
+        if not clicked:
+            wiz_log.warning("FlexJobs wizard step %d: unable to click Next", step)
+            await _snapshot(page, f"wizard_step{step}_no_click")
+
+        url_changed = False
         try:
             await page.wait_for_function(
                 expression="oldUrl => location.href !== oldUrl",
                 arg=current_url,
-                timeout=12000,
+                timeout=10000,
             )
+            url_changed = True
         except PlaywrightTimeoutError:
+            url_changed = False
+
+        still_wizard = _on_wizard(page.url)
+        if not still_wizard:
+            wiz_log.info("FlexJobs wizard escaped after click at step %d; url=%s", step, page.url[:120])
+            return
+        if not url_changed and still_wizard:
             wiz_log.warning("FlexJobs wizard step %d: URL did not change after click", step)
+            if step >= max_steps - 1:
+                wiz_log.info("FlexJobs wizard step %d: forcing direct navigation to results_url", step)
+                try:
+                    await page.goto(
+                        results_url,
+                        wait_until="domcontentloaded",
+                        timeout=NAVIGATE_TIMEOUT_MS,
+                        referer="https://www.flexjobs.com/",
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(_jitter(2500, 1200))
+                return
             await asyncio.sleep(1.0)
-    wiz_log.warning("FlexJobs wizard escape exceeded %d steps; stopping", max_steps)
+    wiz_log.warning("FlexJobs wizard escape exceeded %d steps; falling through to results anyway", max_steps)
 
 
 async def _dismiss_soft_reg_modal(page: Page) -> None:
@@ -512,9 +639,9 @@ async def _collect_results(
             nav_log.info("FlexJobs stop condition 1: 3 consecutive pages with 0 cards parsed => pages exhausted")
             break
         nav_log.info(
-            "FlexJobs page=%d (walked %d) batch_seen=%d batch_matched_post_filter=%d new_cards=%d matched_after_filters_total=%d rows_now=%d cap=%s consec_no_growth=%d",
-            idx, pages_walked, batch["batch_seen"], batch["batch_matched"], new_cards, len(out_rows), len(out_rows), max_listings, consecutive_no_growth,
-        )
+                "FlexJobs page=%d (walked %d) batch_seen=%d batch_matched_post_filter=%d new_cards=%d matched_after_filters_total=%d rows_now=%d cap=%s consec_no_growth=%d",
+                idx, pages_walked, batch["batch_seen"], batch["batch_matched"], new_cards, len(out_rows), len(out_rows), max_listings, consecutive_no_growth,
+            )
         if target_cap and len(out_rows) >= target_cap:
             nav_log.info(
                 "FlexJobs post-filter row count %d >= target_cap %d => stop condition 3 (max-count satisfied).",
@@ -604,7 +731,7 @@ async def scrape(
                 except Exception:
                     pass
                 await asyncio.sleep(_jitter(2500, 1500))
-                await _maybe_escape_job_wizard(page)
+                await _maybe_escape_job_wizard(page, results_url=results_url)
                 await _dismiss_soft_reg_modal(page)
                 try:
                     title = (await page.title()) or ""
