@@ -162,9 +162,8 @@ def _matches_location(location_filter: str, resolved_location: str) -> bool:
         for token in REMOTE_SYNONYMS:
             if token in haystack_lower:
                 return True
-    if location_filter.lower() in resolved_location.lower():
-        return True
-    return False
+    overlap = len(filter_tokens & location_tokens)
+    return overlap >= max(1, len(filter_tokens) // 2)
 
 
 def _normalize_job(
