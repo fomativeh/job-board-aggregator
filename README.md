@@ -1,7 +1,7 @@
 # Multi-Source Job Board Aggregator
 
 Pulls software job listings from Greenhouse (JSON API) and Glassdoor (Patchright + real Chrome) into a normalized dataset backed by MongoDB. Exports a paired CSV and JSON on every run.
-
+![Demo](./assets/demo.gif)
 ## Sources
 
 | Source | Method |
@@ -169,7 +169,7 @@ Each invocation writes a paired CSV + JSON into `output/` (or whatever `--output
 ```
 
 ## Tests
-
+![Pytest all tests passing](./assets/pytest.jpg)
 ```powershell
 $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
 python -m pytest test/
