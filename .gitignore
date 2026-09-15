@@ -11,7 +11,6 @@ env/
 .mypy_cache/
 .pytest_cache/
 .tox/
-.env
 session/
 output/
 logs/
@@ -26,7 +25,12 @@ debug/
 .DS_Store
 Thumbs.db
 .idea/
-.vscode/
 *.swp
 *.swo
 *~
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore
+config.bat
+node_modules
