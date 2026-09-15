@@ -105,7 +105,13 @@ CSV header:
 title,company,location,salary,url,source,scraped_at,url_hash
 ```
 
+![CSV sample](./assets/sample_csv_output.jpg)
+
 Each JSON row also includes a recomputed `url_hash_verified` boolean that re-hashes the URL during export and compares it to the stored digest.
+
+### Storage
+
+![MongoDB collection and documents](./assets/mongo_collection.jpg)
 
 ## How each source is fetched
 
