@@ -4,6 +4,7 @@ import asyncio
 import csv
 import logging
 import math
+import random
 from typing import Awaitable, Callable, Optional, Sequence, TypedDict
 
 import httpx
@@ -16,7 +17,7 @@ from .schema import (
     dedup_in_memory,
     validate_listing,
 )
-from .scrapers import flexjobs, glassdoor, greenhouse
+from .scrapers import glassdoor, greenhouse
 from .storage import Storage, MongoConnectionError
 
 log: logging.Logger = logging.getLogger(__name__)
@@ -44,14 +45,9 @@ def _default_builders() -> list[tuple[str, ScrapeBuilder]]:
         _ = client
         return glassdoor.scrape(q, loc, max_listings=cap)
 
-    def fj(client: httpx.AsyncClient, q: str, loc: str, cap: Optional[int]) -> Awaitable[list[JobListing]]:
-        _ = client
-        return flexjobs.scrape(q, loc, max_listings=cap)
-
     return [
         ("greenhouse", gh),
         ("glassdoor", gd),
-        ("flexjobs", fj),
     ]
 
 
@@ -59,15 +55,23 @@ def pick_backup_scrapers_by_quota(
     delivered: dict[str, int],
     target_cap: int,
     *,
-    n_sources: int = 3,
+    n_sources: int = 2,
+    exhausted: Optional[set[str]] = None,
+    top_k: Optional[int] = 1,
 ) -> list[str]:
     per_source_share = max(1, math.ceil(target_cap / n_sources))
     ranked: list[tuple[float, int, str]] = []
+    skip = exhausted if isinstance(exhausted, set) else set()
     for name, count in delivered.items():
+        if name in skip:
+            continue
         ratio: float = count / per_source_share if per_source_share else 0.0
         ranked.append((ratio, count, name))
     ranked.sort(key=lambda t: (t[0], -t[1], t[2]))
-    return [name for ratio, _count, name in ranked if ratio < 1.0 or _count == 0]
+    eligible = [name for ratio, _count, name in ranked if ratio < 1.0 or _count == 0]
+    if isinstance(top_k, int) and top_k > 0 and len(eligible) > top_k:
+        return eligible[:top_k]
+    return eligible
 
 
 async def _run_selected(
@@ -75,7 +79,7 @@ async def _run_selected(
     query: str,
     location: str,
     *,
-    per_source_cap: Optional[int],
+    per_source_cap: Optional[int] | dict[str, int],
     round_label: str,
     scrape_builders: Sequence[tuple[str, ScrapeBuilder]],
 ) -> tuple[list[JobListing], dict[str, int]]:
@@ -86,13 +90,18 @@ async def _run_selected(
     tasks: list[Awaitable[list[JobListing]]] = []
     source_order: list[str] = []
     for name, builder in scrape_builders:
-        tasks.append(builder(client, query, location, per_source_cap))
+        cap = per_source_cap
+        if isinstance(cap, dict):
+            cap = cap.get(name, None)
+        coro = builder(client, query, location, cap)
+        task = asyncio.create_task(coro, name=f"scraper:{name}:{round_label}")
+        tasks.append(task)
         source_order.append(name)
     results: tuple[object, ...] = await asyncio.gather(*tasks, return_exceptions=True)
     for name, result in zip(source_order, results, strict=True):
         if isinstance(result, BaseException):
             log.error(
-                "Pipeline round=%s scraper %s raised %s: %s",
+                "[ERR] round=%s src=%s %s: %s",
                 round_label,
                 name,
                 type(result).__name__,
@@ -101,13 +110,13 @@ async def _run_selected(
             continue
         if not isinstance(result, list):
             log.error(
-                "Pipeline round=%s scraper %s returned non-list result - skipping",
+                "[ERR] round=%s src=%s returned non-list - skip",
                 round_label,
                 name,
             )
             continue
         log.info(
-            "Pipeline round=%s scraper %s returned %d listings",
+            "round=%s src=%s => %d rows",
             round_label,
             name,
             len(result),
@@ -119,7 +128,7 @@ async def _run_selected(
                 validate_listing(listing)
             except ValidationError as exc:
                 log.warning(
-                    "Pipeline round=%s scraper %s row %d failed validation (%s) - skipping row",
+                    "[WARN] round=%s src=%s row=%d invalid: %s - skip",
                     round_label,
                     name,
                     idx,
@@ -130,7 +139,7 @@ async def _run_selected(
             kept += 1
         if kept != len(result):
             log.info(
-                "Pipeline round=%s scraper %s kept %d of %d raw listings after validation",
+                "round=%s src=%s kept %d/%d after validation",
                 round_label,
                 name,
                 kept,
@@ -161,9 +170,24 @@ async def run_all_scrapers(
     )
     builders = _default_builders()
     n_sources = len(builders)
-    per_source_cap_initial: Optional[int] = None
+    per_source_cap_initial: Optional[int] | dict[str, int] = None
     if target_cap is not None:
-        per_source_cap_initial = max(1, math.ceil(target_cap / n_sources))
+        base = target_cap // n_sources
+        remainder = target_cap % n_sources
+        names = [name for name, _ in builders]
+        caps: dict[str, int] = {n: base for n in names}
+        if remainder > 0:
+            lucky = random.sample(names, k=remainder)
+            for n in lucky:
+                caps[n] = base + 1
+        for n in names:
+            if caps[n] < 1:
+                caps[n] = 1
+        per_source_cap_initial = caps
+        log.info(
+            "Quota split target=%d n_sources=%d base=%d remainder=%d -> per-source caps=%s",
+            target_cap, n_sources, base, remainder, caps,
+        )
 
     all_listings: list[JobListing] = []
     async with httpx.AsyncClient(
@@ -189,29 +213,54 @@ async def run_all_scrapers(
         if current >= target_cap:
             return all_listings
         running_counts: dict[str, int] = dict(delivered_initial)
+        exhausted_sources: set[str] = {n for n, c in delivered_initial.items() if c <= 0}
+        if exhausted_sources:
+            log.info(
+                "Pipeline holdback: marking scrapers exhausted (initial 0 rows, never re-open): %s",
+                sorted(exhausted_sources),
+            )
         for round_idx in range(1, MAX_HOLDBACK_ROUNDS + 1):
             shortfall = target_cap - current
             if shortfall <= 0:
                 break
             rerun_names = pick_backup_scrapers_by_quota(
-                running_counts, target_cap, n_sources=n_sources
+                running_counts, target_cap, n_sources=n_sources,
+                exhausted=exhausted_sources, top_k=1,
             )
             if not rerun_names:
                 log.info(
-                    "Pipeline holdback round=%s: all scrapers met their per-source quota; skipping redundant rerun",
+                    "Pipeline holdback round=%s: no eligible non-exhausted scraper (all satisfied/empty); skip",
                     round_idx,
                 )
                 break
             selected_builders: list[tuple[str, ScrapeBuilder]] = [
                 (name, builder) for (name, builder) in builders if name in rerun_names
             ]
-            headroom_per_source = max(
-                per_source_cap_initial or 1,
-                math.ceil(shortfall / max(1, len(selected_builders))) * 2,
+            sel_count = max(1, len(selected_builders))
+            headroom_base = shortfall // sel_count
+            headroom_rem = shortfall % sel_count
+            headroom_caps: dict[str, int] = {}
+            sel_names = [name for name, _ in selected_builders]
+            for n in sel_names:
+                headroom_caps[n] = headroom_base
+            if headroom_rem > 0 and sel_names:
+                lucky2 = random.sample(sel_names, k=headroom_rem)
+                for n in lucky2:
+                    headroom_caps[n] = headroom_caps[n] + 1
+            per_source_headroom_floor = (
+                per_source_cap_initial
+                if isinstance(per_source_cap_initial, int) and per_source_cap_initial > 0
+                else max(per_source_cap_initial.values()) if isinstance(per_source_cap_initial, dict) and per_source_cap_initial else 1
             )
+            for n in sel_names:
+                headroom_caps[n] = max(
+                    per_source_headroom_floor,
+                    headroom_caps[n] * 2,
+                )
+            headroom_per_source: Optional[int] | dict[str, int] = headroom_caps
             log.info(
                 "Pipeline holdback round=%s: shortfall=%d (have %d of %d target); "
-                "rerunning ONLY scrapers=%s (skipping satisfied=%s) with per-source headroom cap=%d",
+                "rerunning ONLY scrapers=%s (skipping satisfied=%s) with per-source headroom caps=%s",
                 round_idx,
                 shortfall,
                 current,
@@ -245,6 +294,13 @@ async def run_all_scrapers(
                 new_kept,
                 len(extra),
             )
+            if new_kept == 0 and len(selected_builders) == 1:
+                only = selected_builders[0][0]
+                exhausted_sources.add(only)
+                log.info(
+                    "Pipeline holdback round=%s: %s rerun delivered 0 new uniques -> mark exhausted (never re-opens)",
+                    round_idx, only,
+                )
             current = len(seen_urls)
             if current >= target_cap:
                 break
@@ -277,7 +333,7 @@ async def run_pipeline(
             before_trim,
         )
     log.info(
-        "Pipeline raw=%d deduped=%d dropped=%d",
+        "raw=%d deduped=%d dropped=%d",
         len(all_listings),
         len(deduped),
         dropped,
@@ -293,7 +349,7 @@ async def run_pipeline(
         try:
             inserted, db_dupes = storage.insert_many_unique(deduped)
             log.info(
-                "Mongo persist complete: inserted=%d db_duplicates=%d",
+                "mongo write: inserted=%d already_stored=%d",
                 inserted,
                 db_dupes,
             )

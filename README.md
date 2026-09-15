@@ -1,164 +1,178 @@
-# Job Board Aggregator
+# Multi-Source Job Board Aggregator
 
-Scrape 3 job boards in parallel, normalize listings, dedupe across sources, persist to MongoDB, and export timestamped CSV/JSON. Built for Python 3.11+ with MongoDB storage, curl-cffi HTTP, and Patchright (patched Playwright) browser automation with real persistent Chrome profiles.
+Pulls software job listings from Greenhouse (JSON API) and Glassdoor (Patchright + real Chrome) into a normalized dataset backed by MongoDB. Exports a paired CSV and JSON on every run.
 
 ## Sources
 
-| Source       | Transport          | Mechanism                                                               |
-|--------------|--------------------|-------------------------------------------------------------------------|
-| Greenhouse   | HTTP (curl-cffi fingerprint) | Direct boards-api.greenhouse.io JSON across multiple company boards    |
-| Glassdoor    | Patchright + Chrome persistent profile  | Form fill, paginate via "Show more jobs", parse card DOM               |
-| FlexJobs     | Patchright + Chrome                   | Direct encoded `/search?searchkeyword=&joblocations=` URL, wizard escape, pagination link |
+| Source | Method |
+|--------|--------|
+| Greenhouse | `httpx.AsyncClient` against public boards; post-fetch filters by query/location token overlap. |
+| Glassdoor  | Patchright Chromium context using your local Google Chrome install, the live Glassdoor search page, and append-only "Show more" pagination. |
 
 ## Install
 
-Requires Python 3.11+ and a MongoDB instance (local or Atlas).
+Requires Python 3.11+, a local MongoDB 4.4+ (or Atlas URI), and Google Chrome on PATH (Patchright uses real Chrome, not bundled Chromium).
 
-```
+```powershell
 git clone https://github.com/fomativeh/job-board-aggregator.git
 cd job-board-aggregator
 python -m venv .venv
-.venv\Scripts\activate    # Windows POSH
+.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 pip install -r requirements.txt
-pip install curl-cffi==0.16.3 patchright==1.51.3
-patchright install chrome
+Copy-Item .env.example .env
+notepad .env
 ```
 
-## Environment
+`.env` has three required fields:
 
-Create a `.env` file in project root (gitignored):
+| Name | Purpose |
+|------|---------|
+| `MONGO_URI` | Local default `mongodb://localhost:27017` or an Atlas `mongodb+srv://…` URI |
+| `MONGO_DB` | Database name (ships with `job_aggregator`) |
+| `MONGO_COLLECTION` | Collection name (ships with `job_listings`) |
 
-```
-MONGODB_URI=mongodb+srv://user:pass@cluster0.xxx.mongodb.net/
-MONGO_DB=job_aggregator
-MONGO_COLLECTION=job_listings
-LOG_LEVEL=INFO
-HTTP_USER_AGENT_OVERRIDE=
-OUTPUT_DIR=
-```
+Optional: `LOG_LEVEL` (one of DEBUG / INFO / WARNING / ERROR / CRITICAL, default INFO) and `LOG_FILE` (additive file log path in addition to stderr).
 
-Lines:
-1. MongoDB connection string. Wrap IPv6 literals in square brackets when required by the URI parser.
-2. Database name.
-3. Collection name (a unique index is enforced on `url_hash`).
-4. One of `DEBUG`, `INFO`, `WARNING`, `ERROR` (case-insensitive, defaults to `INFO`).
-5. Optional UA override string.
-6. Optional absolute or relative output directory (resolved against project root, default `./output`).
+Smoke test MongoDB:
 
-## CLI Usage
-
-Entry point: `python -m src <flags>`
-
-```
-$ python -m src --help
-JOB AGGREGATOR CLI
-Usage: python -m src --query QUERY --location LOCATION [options]
-
-Required:
-  --query STR             Keywords to search (role, stack, company)
-  --location STR          Location filter (city/state/"Remote")
-
-Optional:
-  --max-listings N        Hard cap on final deduped rows (default: unbounded)
-  --max-pages-per-source N Unused slot for future per-source paging limits
-  --output-dir PATH       Override configured export directory
-  --log-level LEVEL       Override .env LOG_LEVEL for this run only
-  --no-mongo              Skip MongoDB storage step, only write CSV+JSON
+```powershell
+python -c "from src.config import load_config; from pymongo import MongoClient; c=MongoClient(load_config().mongo_uri, serverSelectionTimeoutMS=5000); c.admin.command('ping'); print('MongoDB ping OK')"
 ```
 
-Quick example:
+## Run
 
-```
-python -m src --query "python developer" --location Remote --max-listings 30
-```
-
-## Architecture
-
-```
-src/
-  schema.py      JobListing TypedDict, validation, dedup, url_hash
-  config.py      .env loader, OUTPUT_DIR resolver
-  http_utils.py  retry loop, contextual Sec-Fetch headers, cookie jar, UA rotation
-  storage.py     Storage.connect / insert_many_unique, MongoConnectionError,
-                 unique url_hash index for cross-run dedup
-  export.py      timestamped CSV + JSON writers, RunOutput paths
-  scrapers/
-    greenhouse.py    8 company boards, JSON API, token overlap location filter
-    glassdoor.py     Patchright persistent Chrome, form fill, load-more paginate
-    flexjobs.py      Direct encoded URL, wizard escape loop, soft-reg modal dismiss
-  pipeline.py    run_all_scrapers: initial round + selective holdback reruns
-                 (pick_backup_scrapers_by_quota ranks under-performing scrapers
-                  by per-source share ratio; satisfied sources are skipped)
-  cli.py         argparse, logging, pipeline entrypoint
-  __main__.py    `python -m src`
+```powershell
+python -B -m src --query python --location Remote --max-listings 10
 ```
 
-Orchestration round-trip:
-1. Initial round runs all 3 scrapers with per-source cap `ceil(target / 3)`.
-2. If total unique URLs < `--max-listings`, `pick_backup_scrapers_by_quota()` ranks scrapers by `delivered / per_source_share` and holdback rounds rerun ONLY sources below 1.0 ratio (zero-delivered always included, ranked worst first). Fully-satisfied sources are skipped entirely.
-3. Final in-memory `url_hash` dedup, `--max-listings` trim, Mongo insert (ordered=False, `BulkWriteError` code 11000 counted as DB duplicates), CSV+JSON export.
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--query` | empty | Keyword filter applied across title, company, location. Empty accepts the default/latest listings each source returns. |
+| `--location` | empty | Location match, including Remote synonyms (Remote, WFH, US, United States, Worldwide, and so on). Empty skips the filter. |
+| `--max-listings` | 20 | Hard cap on deduped listings before DB and export writes. Also seeds each scraper's initial cap. |
+| `--output-dir` | `output` | Directory for the CSV + JSON pair; created if missing. |
+| `--log-level` | unset | Overrides `LOG_LEVEL` from `.env`. |
+| `--log-file` | unset | Overrides `LOG_FILE` from `.env`. |
+
+### Quota split between the two scrapers
+
+Given a target `--max-listings N`, each scraper gets `N // 2`, then any remainder of 1 is handed to one scraper picked at random per run. Examples:
+
+- `--max-listings 10` → both scrapers cap at 5
+- `--max-listings 11` → random scraper gets 6, the other 5
+- `--max-listings 31` → random scraper gets 16, the other 15
+
+If after the initial parallel pass fewer unique listings survived dedup than the target, the pipeline can hold back and re-run only the single top-ranked non-exhausted scraper with larger caps. Scrapers that returned zero new uniques on their last run are skipped in holdback entirely.
+
+### Sample output
+
+```
+query='python'  location='Remote'  max_listings=10
+
+greenhouse done  rows=5 cap=5 stop=max_listings_satisfied elapsed=7.66s boards=8
+glassdoor   seen=30  keep=5  clicks=0 stop=max_listings_satisfied
+
+storage mongo connected  db=job_aggregator collection=job_listings
+storage [dedup ok] 5 already stored; 5 new inserted
+export csv  …\output\job_listings_20260915_155405.csv  (10 rows)
+export json …\output\job_listings_20260915_155405.json (10 rows)
+
+Listings returned  10
+  greenhouse  5
+  glassdoor   5
+```
 
 ## Schema
 
-### JobListing TypedDict
+Each listing is normalized into seven fields before dedup and storage. Only `salary` is nullable.
 
-```python
-{
-  "title": str,                        # non-empty
-  "company": str,                      # non-empty
-  "location": str,                     # raw location string
-  "salary": str | None,                # "$120,000 - $160,000 USD" style
-  "url": str,                          # absolute listing URL
-  "source": Literal["greenhouse","glassdoor","flexjobs"],
-  "scraped_at": str,                   # UTC ISO-8601
-  "url_hash": str,                     # SHA-256 hexdigest of normalized url
-}
+| Field | Type | Notes |
+|-------|------|-------|
+| `title` | string | e.g. `"Senior Backend Engineer, Payments"` |
+| `company` | string | e.g. `"Stripe"` |
+| `location` | string | e.g. `"Remote - EMEA"`, `"New York, NY"`, `"United States"` |
+| `salary` | string \| null | e.g. `"$160,000 - $210,000 USD"`; `null` when undisclosed |
+| `url` | string | absolute HTTP(S) URL to the job detail page |
+| `source` | string | `"greenhouse"` or `"glassdoor"` |
+| `scraped_at` | string | ISO-8601 UTC timestamp |
+
+A SHA-256 hex digest of `url` (called `url_hash`) is the dedup key. The same unique-index guarantee is enforced in MongoDB via a unique index on `url_hash`, so each URL persists once across runs regardless of how many times it re-appears on a board.
+
+CSV header:
+
+```
+title,company,location,salary,url,source,scraped_at,url_hash
 ```
 
-### Public module surfaces
+Each JSON row also includes a recomputed `url_hash_verified` boolean that re-hashes the URL during export and compares it to the stored digest.
 
-- **storage.Storage(config: Config)**
-  - `connect() -> None` — raises `MongoConnectionError` if ping/admin command fails.
-  - `insert_many_unique(listings: list[JobListing]) -> tuple[int, int]` — `(inserted, duplicates_skipped)`. Cross-run dedup via `unique=True` `url_hash` MongoDB index + ordered=False insert + BulkWriteError 11000 tally.
-  - `close() -> None`.
+## How each source is fetched
 
-- **export.write_both(listings, output_dir) -> RunOutput**
-  - `RunOutput.csv_path` / `.json_path` absolute paths. Timestamp format `YYYYMMDD_HHMMSS`. CSV header order matches the TypedDict key declaration order.
+### Greenhouse
 
-- **pipeline.run_pipeline(query, location, ...)** — top-level runner returns `PipelineResult`: `{listings, exports}`. Returns empty exports on filesystem write errors (ERROR log line emitted).
+Plain `httpx` with rotating desktop user-agents, Chrome-shaped Accept/Sec-Fetch-* headers, a Google-first Referer fallback for cross-origin fetches, 0.8–2.4 s jitter between requests, retry on transient network errors / 429 / 5xx, and skip + log on hard 4xx client errors.
 
-## Troubleshooting
+### Glassdoor
 
-**Patchright / Chrome crashing on first run.** Run `patchright install chrome` once. Verify `chrome://version` in the launched profile matches expected channel.
+The scraper launches a persistent Patchright context that points at your locally installed Google Chrome binary (`channel = "chrome"`, headless off). Args strip the `--enable-automation` flag and disable `AutomationControlled` on the Blink side. The same user-data dir is warmed up across runs; stale cache dirs (GPUCache, Code Cache, Service Worker, Disk Cache) are cleared on module import.
 
-**Glassdoor `Recommended Jobs For You` loads but 0 cards parse.** Glassdoor renames class hashes monthly. Debug dumps are written to `./debug/glassdoor/*.html` each run. Update the selector tuples in `src/scrapers/glassdoor.py` `_extract_cards()`. INFO-level sample logs dump the first 12 parsed card fields plus REJECTED reason lines (missing_field / query_filter tokens_hit / location_filter want vs got).
+Every request is routed through a handler that overwrites User-Agent with a Chrome 128 string, the full Sec-CH-UA family (arch, bitness, full-version-list, platform, platform-version, WoW64, model), and per-resource `Sec-Fetch-Dest/Mode/Site/User` that matches whether the resource is a document, script, image, or font. Referer falls back to `https://www.google.com/` when no prior Referer exists.
 
-**FlexJobs landing on `/job_wizard/remote/why_remote`.** Server-side 302 gate on first `/search` hit. `_maybe_escape_job_wizard()` handles this: step 1 sets cookie state by letting the redirect land; step 2 re-navigates to the results URL with explicit `Referer: https://www.flexjobs.com/` and `Sec-Fetch-Site: same-origin` headers. If still stuck, `page.evaluate()` scans all `<a>`/`<button>` for regex `/\bNext\b/i` and calls native `click()` bypassing Playwright visibility checks.
+Auth / signup overlays are closed at three levels: a MutationObserver in the init script that hides nodes the instant they mount, a 250 ms polling fallback in the same init script, and finally an explicit pre-extraction pass that clicks the close button, invokes `.close()` on dialog nodes, hard-hides containers with `display:none`, and unlocks `<body>` overflow.
 
-**FlexJobs "Success! We found N job matches" soft-reg modal blocks pagination.** `_dismiss_soft_reg_modal()` detects by class markers `sc-34eca615-0` / `iuDbli` + id `soft-reg-continue-btn`. Attempts close-button click (force=True), then falls back to `page.evaluate()` removing the root modal DOM nodes plus clearing `body.style.overflow` scroll locks. Card extraction still works even if removal fails because cards underlay the overlay in DOM and `querySelectorAll()` walks by selector regardless of visual z-index.
+Card fields are extracted directly from each `<li>` on the jobs list via a single `page.evaluate` pass; nothing is clicked on the right pane and no new tabs are opened. Selectors used:
 
-**Mongo `insert_many_unique` inserts 0 new listings because URLs already stored from earlier runs.** Expected behavior for idempotent repeat runs; dedup works correctly.
+- title: `a[data-test="job-title"]`
+- company: `span[class*="EmployerProfile_compactEmployerName__"]`
+- location: `[data-test="emp-location"]`
+- salary: `[data-test="detailSalary"]`
+- url: anchor `href` resolved to absolute via `new URL(url, location.href).href`
 
-**Holdback rounds look like they "reopen browsers for no reason".** After the selective-holdback fix, only under-quota scrapers are reranked for reruns. If a scraper delivered >= its per-source share it is skipped by name and its browser never reopens (INFO log line `skipping satisfied=[...]` confirms). If all three scrapers meet their share the holdback round exits early with an INFO log line.
+"Show more" clicks are the cursor: after each click the page polls for up to 25 s for `<li>` growth, and each subsequent extract runs only over the newly appended slice `[initial_count:]` so cards are never reprocessed. Three consecutive clicks with zero new `<li>` ends pagination.
+
+## Output
+
+Each invocation writes a paired CSV + JSON into `output/` (or whatever `--output-dir` you pass). Files share the same UTC timestamp stem.
+
+```
+<repo>/
+├── output/
+│   ├── job_listings_20260915_155405.csv
+│   └── job_listings_20260915_155405.json
+├── session/
+│   └── patchright_chrome_profile_glassdoor/
+├── src/
+│   ├── __main__.py
+│   ├── cli.py
+│   ├── config.py
+│   ├── export.py
+│   ├── http_utils.py
+│   ├── pipeline.py
+│   ├── schema.py
+│   ├── storage.py
+│   └── scrapers/
+│       ├── greenhouse.py
+│       └── glassdoor.py
+├── test/
+│   └── test_dedup_and_export.py
+├── pytest.ini
+├── requirements.txt
+├── .env.example
+└── .gitignore
+```
 
 ## Tests
 
-29 tests cover:
-- schema deterministic `url_hash`
-- `validate_listing` rejects invalid sources (source-lock check for 3-source-only enum, M10 fix)
-- `build_headers` contextual 3-way `Sec-Fetch-Site` by referer origin (M13 fix)
-- `load_config` resolves relative OUTPUT_DIR against PROJECT_ROOT not CWD (M12 fix)
-- Storage.connect raises before connect and bad URIs raise MongoConnectionError
-- Storage unique url_hash index correctly deduplicates (M14 fix)
-- In-memory dedup first-occurrence-wins ordering
-- Export CSV/JSON same filename timestamp + column ordering
-- CLI log-level coerce case, invalid values default to INFO
-
-Run with:
-```
-pytest -q test/
+```powershell
+$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+python -m pytest test/
+python -m pytest test/ --cov=src --cov-report=term-missing
+python -m mypy --strict src/ test/
 ```
 
-## License
+## Exit codes
 
-Project code only; scrapers respect robots.txt limits and rate-limiting via per-request jitter.
+`0` success; `1` unhandled exception (see stderr traceback); `2` configuration error (check `.env`); `3` source retries exhausted; `4` Glassdoor scraper fatal; `130` user interrupt.
+
+MIT. Respect robots.txt and rate limits when running the scrapers.
