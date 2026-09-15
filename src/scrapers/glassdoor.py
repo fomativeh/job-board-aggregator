@@ -595,11 +595,66 @@ async def _submit_search(page: Page, query: str, location_filter: str) -> str:
     return new_url or ""
 
 
+async def _wait_for_search_url_change(
+    page: Page,
+    pre_submit_url: str,
+    query: str,
+    location_filter: str,
+    timeout_ms: int = 45_000,
+) -> str:
+    q_tokens = _tokens(query)
+    l_tokens = _tokens(location_filter)
+
+    def _looks_like_search_result(u: str, pre: str) -> bool:
+        if not u or not pre:
+            return False
+        if u.rstrip("/") == pre.rstrip("/"):
+            return False
+        try:
+            p = urlparse(u)
+        except Exception:
+            return False
+        path = p.path or ""
+        if "/SRCH_" in path:
+            return True
+        if "/job/" in path.lower() or "/jobs/" in path.lower() or "/Job/" in path:
+            return True
+        combined = f"{p.path}?{p.query}".lower()
+        for t in q_tokens:
+            if len(t) >= 4 and t in combined:
+                return True
+        for t in l_tokens:
+            if len(t) >= 3 and t in combined:
+                return True
+        if "pos=" in p.query.lower() or "srch" in p.query.lower():
+            return True
+        return False
+
+    deadline = _perf_counter() + (timeout_ms / 1000.0)
+    last = page.url or pre_submit_url
+    while _perf_counter() < deadline:
+        current = page.url or last
+        if _looks_like_search_result(current, pre_submit_url):
+            return current
+        try:
+            await page.wait_for_timeout(500)
+        except Exception:
+            break
+    if _looks_like_search_result(page.url or "", pre_submit_url):
+        return page.url or ""
+    raise GlassdoorScrapeError(
+        f"post-submit URL did not change to a search-result page within {timeout_ms/1000:.0f}s "
+        f"(pre={pre_submit_url[:180]!r} post={(page.url or '')[:180]!r}); "
+        "aborting to avoid scraping pre-loaded/recent-searches cards"
+    )
+
+
 async def _search_and_collect(
     page: Page,
     query: str,
     location_filter: str,
     target_cap: Optional[int],
+    pre_search_li_count: int = 0,
 ) -> list[JobListing]:
     try:
         await page.wait_for_timeout(int(_jitter(3000, 5000)))
@@ -620,6 +675,19 @@ async def _search_and_collect(
         raise GlassdoorScrapeError(f"jobs list ul not found: {e}")
 
     total = await _count_li_count(page, li_sel)
+    effective_first_start = max(0, int(pre_search_li_count or 0))
+    if effective_first_start > 0:
+        log.info(
+            "first-batch slice guard: extracting POST-SEARCH lis only from idx=%d (pre-search had %d stale cards; current post-search ul total=%d)",
+            effective_first_start,
+            effective_first_start,
+            total,
+        )
+        if total <= effective_first_start:
+            raise GlassdoorScrapeError(
+                f"post-search ul only has {total} li <= pre-search stale count={effective_first_start}; "
+                "no new cards added after real search — guard aborted to skip pre-loaded list"
+            )
     if total == 0:
         try:
             await page.evaluate(
@@ -682,14 +750,14 @@ async def _search_and_collect(
                 len(out_rows),
             )
 
-    initial_batch = await _batch_extract(page, li_sel, 0)
+    initial_batch = await _batch_extract(page, li_sel, effective_first_start)
     if not initial_batch:
         try:
             await page.evaluate(
                 '() => { const n = document.querySelector(\'ul[aria-label="Jobs List"]\'); if (n) n.scrollIntoView({block: "start"}); window.scrollBy(0, 600); }'
             )
             await page.wait_for_timeout(1500)
-            initial_batch = await _batch_extract(page, li_sel, 0)
+            initial_batch = await _batch_extract(page, li_sel, effective_first_start)
         except Exception:
             pass
     if initial_batch:
@@ -981,6 +1049,22 @@ async def scrape(
                     else:
                         last_err = err
                         break
+                pre_submit_url = ""
+                pre_search_li_count = 0
+                try:
+                    pre_submit_url = str(page.url or "")
+                    ul_sel_tmp = 'ul[aria-label="Jobs List"][class*="JobsList_jobsList__"]'
+                    li_sel_tmp = ul_sel_tmp + " > li"
+                    pre_search_li_count = int(await _count_li_count(page, li_sel_tmp) or 0)
+                except Exception:
+                    pre_submit_url = str(page.url or "")
+                    pre_search_li_count = 0
+                if pre_search_li_count > 0:
+                    log.info(
+                        "pre-search guard: %d <li> cards already visible on landing (recent/searches); will skip in first batch (url=%s)",
+                        pre_search_li_count,
+                        pre_submit_url[:140],
+                    )
                 try:
                     result_url = await _submit_search(page, query, location)
                     if result_url:
@@ -1000,11 +1084,36 @@ async def scrape(
                         continue
                     else:
                         break
+                try:
+                    confirmed_url = await _wait_for_search_url_change(
+                        page,
+                        pre_submit_url=pre_submit_url,
+                        query=query,
+                        location_filter=location,
+                        timeout_ms=45_000,
+                    )
+                    log.info("post-search URL confirmed: %s", confirmed_url[:180])
+                except Exception as e:
+                    last_err = f"search URL guard failed: {e}"
+                    if attempt < NAVIGATE_MAX_ATTEMPTS:
+                        log.warning("Glassdoor %s retry %d/%d", last_err, attempt, NAVIGATE_MAX_ATTEMPTS)
+                        try:
+                            if page:
+                                await page.wait_for_timeout(int(_jitter(2000, 3500)))
+                            await ctx.close()
+                        except Exception:
+                            pass
+                        ctx = None
+                        handles = None
+                        continue
+                    else:
+                        break
                 rows = await _search_and_collect(
                     page=page,
                     query=query,
                     location_filter=location,
                     target_cap=target_cap,
+                    pre_search_li_count=pre_search_li_count,
                 )
                 collected.extend(rows)
                 break
