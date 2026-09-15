@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+import json as _json
 import logging
 import random
 import re
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Optional
+from urllib.parse import urlparse
 
 from patchright.async_api import (
     Browser,
@@ -14,36 +18,46 @@ from patchright.async_api import (
     Error as PlaywrightError,
     Page,
     Playwright,
+    Route,
     TimeoutError as PlaywrightTimeoutError,
     ViewportSize,
     async_playwright,
 )
 
-from ..http_utils import jitter
 from ..schema import JobListing, SalaryType, make_url_hash, utc_now_iso
 
 log: logging.Logger = logging.getLogger(__name__)
 
 SOURCE_NAME: Final[str] = "glassdoor"
 START_URL: Final[str] = "https://www.glassdoor.com/Job/index.htm"
-NAVIGATE_TIMEOUT_MS: Final[int] = 70_000
+NAVIGATE_TIMEOUT_MS: Final[int] = 90_000
 SCRAPER_TOTAL_TIMEOUT_SECONDS: Final[int] = 900
-SEARCH_SETTLE_MS: Final[int] = 3500
-PAGE_IDLE_MS: Final[int] = 900
-MAX_LOAD_MORE_CLICKS: Final[int] = 80
-LOAD_MORE_WAIT_MS_AFTER_CLICK: Final[int] = 2200
-SAMPLE_LOG_FIRST_CARDS: Final[int] = 12
+MAX_LOAD_MORE_BATCHES: Final[int] = 80
+LOAD_MORE_POLL_DEADLINE_SEC: Final[float] = 25.0
 NAVIGATE_MAX_ATTEMPTS: Final[int] = 3
+SAMPLE_LOG_FIRST_N_CARDS: Final[int] = 5
+RAW_DUMP_FIRST_N_CARDS: Final[int] = 5
 
 PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent.parent.parent
 SESSION_DIR: Final[Path] = PROJECT_ROOT / "session"
 PROFILE_DIR: Final[Path] = SESSION_DIR / "patchright_chrome_profile_glassdoor"
-DEBUG_DIR: Final[Path] = PROJECT_ROOT / "debug" / "glassdoor"
-PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+for _sub in (SESSION_DIR, PROFILE_DIR):
+    _sub.mkdir(parents=True, exist_ok=True)
 
-VIEWPORT: Final[ViewportSize] = {"width": 1440, "height": 920}
-LANGS: Final[str] = "en-US,en;q=0.7"
+_STALE_DIRS: tuple[Path, ...] = (
+    PROFILE_DIR / "Default" / "GPUCache",
+    PROFILE_DIR / "Default" / "Service Worker" / "ScriptCache",
+    PROFILE_DIR / "Default" / "Code Cache",
+    PROFILE_DIR / "Default" / "Cache",
+)
+for _d in _STALE_DIRS:
+    if _d.exists():
+        try:
+            shutil.rmtree(_d)
+        except Exception:
+            pass
+
+LANGS: Final[str] = "en-US,en;q=0.9"
 
 TOKEN_RE: Final[re.Pattern[str]] = re.compile(r"\w+")
 REMOTE_SYNONYMS: Final[frozenset[str]] = frozenset(
@@ -64,6 +78,9 @@ REMOTE_SYNONYMS: Final[frozenset[str]] = frozenset(
         "100% remote",
         "100 remote",
         "any location",
+        "united states",
+        "us",
+        "usa",
     )
 )
 
@@ -107,7 +124,7 @@ def _matches_location(location_filter: str, candidate_location: str) -> bool:
         for syn in REMOTE_SYNONYMS:
             if syn in cand_low:
                 return True
-        if cand == "" or cand.lower() in {"", "any location", "multiple"}:
+        if cand == "" or cand.lower() in {"", "any location", "multiple", "remote (temporarily remote", "remote", "hybrid remote"}:
             return True
         return False
     want_tok = _tokens(want)
@@ -123,60 +140,12 @@ def _matches_location(location_filter: str, candidate_location: str) -> bool:
     return len(want_tok & cand_tok) >= max(1, len(want_tok) // 2)
 
 
-async def _route_stealth(route, request) -> None:
-    headers = dict(request.headers or {})
-    extra = {
-        "sec-ch-ua": '"Chromium";v="128", "Google Chrome";v="128", "Not.A/Brand";v="24"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-        "sec-fetch-dest": "document",
-        "sec-fetch-mode": "navigate",
-        "sec-fetch-site": "none",
-        "sec-fetch-user": "?1",
-        "upgrade-insecure-requests": "1",
-        "dnt": "1",
-    }
-    for k, v in extra.items():
-        if k.lower() not in headers:
-            headers[k.lower()] = v
-    await route.continue_(headers=headers)
-
-
-async def _snapshot(page: Page, stem: str) -> None:
-    try:
-        png = DEBUG_DIR / f"{stem}.png"
-        await page.screenshot(path=str(png), full_page=False)
-    except Exception:
-        pass
-    try:
-        html_file = DEBUG_DIR / f"{stem}.html"
-        html_file.write_text(await page.content(), encoding="utf-8", errors="ignore")
-    except Exception:
-        pass
-
-
-def _wall_signals(body_text: str) -> dict[str, list[str]]:
-    low = body_text.lower()
-    walls = {
-        "cloudflare": ["cloudflare", "just a moment", "ray id", "challenge"],
-        "captcha": ["captcha", "verify you are human", "not a robot", "security check"],
-        "perimeterx": ["perimeterx", "px-captcha", "px_bm"],
-    }
-    hits: dict[str, list[str]] = {}
-    for name, words in walls.items():
-        found = [w for w in words if w in low]
-        if found:
-            hits[name] = found
-    return hits
-
-
 def _normalize_job(
     title: str,
     company: str,
     location: str,
     salary_raw: str,
     url: str,
-    job_id: Optional[str],
     query: str,
     location_filter: str,
 ) -> Optional[JobListing]:
@@ -187,6 +156,8 @@ def _normalize_job(
     salary: SalaryType = salary_text or None
     url = (url or "").strip()
     if not (title and company and url):
+        return None
+    if not _matches_location(location_filter, location):
         return None
     if not _matches_query(query, title, company, location):
         return None
@@ -200,518 +171,685 @@ def _normalize_job(
         "scraped_at": utc_now_iso(),
         "url_hash": make_url_hash(url),
     }
-    _ = job_id
     return listing
 
 
-async def _extract_cards(
-    page: Page,
-    seen_card_keys: set[str],
-    out_rows: list[JobListing],
-    query: str,
-    location_filter: str,
-) -> tuple[int, int]:
-    card_sel = (
-        "ul[aria-label='Jobs List'] li[data-test='jobListing'],"
-        "div[class*='JobsList_wrapper'] li[data-test='jobListing'],"
-        "div.JobsList_wrapper__EyUF6 li[data-test='jobListing'],"
-        "li[data-test='jobListing'],"
-        "div.ReactModalPortal li[data-test='jobListing'],"
-        "div[data-test='job-result-card'],"
-        "article[data-test='job-card']"
-    )
+_CHROME_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/128.0.0.0 Safari/537.36"
+)
+_CHROME_SEC_CH_UA = '"Chromium";v="128", "Not)A;Brand";v="24", "Google Chrome";v="128"'
+_SEC_CH_UA_ARCH = '"x86"'
+_SEC_CH_UA_BITNESS = '"64"'
+_SEC_CH_UA_FULL_VERSION = '"128.0.6613.137"'
+_SEC_CH_UA_FULL_VERSION_LIST = (
+    '"Chromium";v="128.0.6613.137", '
+    '"Not)A;Brand";v="24.0.0.0", '
+    '"Google Chrome";v="128.0.6613.137"'
+)
+_SEC_CH_UA_PLATFORM_VERSION = '"15.0.0"'
+_SEC_CH_UA_WOW64 = "?0"
+_SEC_CH_UA_MODEL = '""'
+
+_FETCH_LIKE_RE = re.compile(r"^(fetch|xhr|jsonp|cors|script)$", re.I)
+
+
+def _infer_resource_type(request: Any) -> str:
     try:
-        cards = await page.query_selector_all(card_sel)
-    except Exception as e:
-        log.warning("Glassdoor cards query_selector_all failed: %s", e)
-        return 0, 0
-    total_seen = 0
-    new_added = 0
-    total_cards = len(cards)
-    progress_step = 5 if total_cards <= 40 else max(5, total_cards // 6)
-    title_sel = "a[data-test='job-title'], a[class*='JobCard_jobTitle'], a.JobCard_jobTitle__GLyJ1, h2 a, a.job-title"
-    link_sel = "a[data-test='job-link'], a[class*='JobCard_trackingLink'], a.JobCard_trackingLink__HMyun, a[href*='/partner/jobListing.htm'], a[href*='/job-listing/']"
-    company_sel = "span[class*='EmployerProfile_compactEmployerName'], span.EmployerProfile_compactEmployerName__9MGcV, span.EmployerProfile_compactEmployerName__LE242, div[data-test='employer-name'] span, span.employer-name, a[class*='CompanyNameLink'], div[class*='EmployerName']"
-    location_sel = "div[data-test='emp-location'], div[class*='JobCard_location'], div.JobCard_location__Ds1fM, span[data-test='location'], div.location, span[class*='JobCard_location']"
-    salary_sel = "div[data-test='detailSalary'], div[class*='JobCard_salaryEstimate'], div.JobCard_salaryEstimate__QpbTW, span[data-test='salary-estimate'], div.salary-estimate"
-    sample_logged = 0
-    for el in cards:
-        total_seen += 1
+        rt = str(request.resource_type or "")
+    except Exception:
+        rt = ""
+    if rt:
+        return rt
+    try:
+        u = str(request.url or "")
+    except Exception:
+        u = ""
+    lower = u.lower()
+    if any(lower.endswith(ext) for ext in (".css",)):
+        return "stylesheet"
+    if any(lower.endswith(ext) for ext in (".js", ".mjs")):
+        return "script"
+    if any(lower.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico")):
+        return "image"
+    if any(lower.endswith(ext) for ext in (".woff", ".woff2", ".ttf", ".otf")):
+        return "font"
+    return "document"
+
+
+async def _route_stealth(route: Route) -> None:
+    try:
+        request = route.request
+        headers = dict(request.headers or {})
+        resource_type = _infer_resource_type(request)
+    except Exception:
         try:
-            job_id_raw = await el.get_attribute("data-jobid")
+            await route.continue_()
         except Exception:
-            job_id_raw = None
-        try:
-            title_el = await el.query_selector(title_sel)
-            title = (await title_el.inner_text()).strip() if title_el else ""
-            href = (await title_el.get_attribute("href")).strip() if title_el else ""
-        except Exception:
-            title = ""
-            href = ""
-        if not href:
+            pass
+        return
+    try:
+        headers.setdefault("User-Agent", _CHROME_UA)
+        headers["Accept-Language"] = LANGS
+        headers["Sec-CH-UA-Mobile"] = "?0"
+        headers["Sec-CH-UA-Platform"] = '"Windows"'
+        headers["Sec-CH-UA"] = _CHROME_SEC_CH_UA
+        headers["Sec-CH-UA-Arch"] = _SEC_CH_UA_ARCH
+        headers["Sec-CH-UA-Bitness"] = _SEC_CH_UA_BITNESS
+        headers["Sec-CH-UA-Full-Version"] = _SEC_CH_UA_FULL_VERSION
+        headers["Sec-CH-UA-Full-Version-List"] = _SEC_CH_UA_FULL_VERSION_LIST
+        headers["Sec-CH-UA-Platform-Version"] = _SEC_CH_UA_PLATFORM_VERSION
+        headers["Sec-CH-UA-WoW64"] = _SEC_CH_UA_WOW64
+        headers["Sec-CH-UA-Model"] = _SEC_CH_UA_MODEL
+        headers["Upgrade-Insecure-Requests"] = "1"
+
+        if resource_type in ("document", "manifest", "other"):
+            headers["Sec-Fetch-Dest"] = "document"
+            headers["Sec-Fetch-Mode"] = "navigate"
+            headers["Sec-Fetch-Site"] = headers.get("Referer") and "same-origin" or "none"
+            headers["Sec-Fetch-User"] = "?1"
+        elif resource_type == "script":
+            headers["Sec-Fetch-Dest"] = "script"
+            headers["Sec-Fetch-Mode"] = "no-cors"
+            headers["Sec-Fetch-Site"] = headers.get("Referer") and "same-origin" or "cross-site"
+        elif resource_type == "stylesheet":
+            headers["Sec-Fetch-Dest"] = "style"
+            headers["Sec-Fetch-Mode"] = "no-cors"
+            headers["Sec-Fetch-Site"] = "same-origin"
+        elif resource_type == "image":
+            headers["Sec-Fetch-Dest"] = "image"
+            headers["Sec-Fetch-Mode"] = "no-cors"
+            headers["Sec-Fetch-Site"] = "same-origin"
+        elif resource_type == "font":
+            headers["Sec-Fetch-Dest"] = "font"
+            headers["Sec-Fetch-Mode"] = "no-cors"
+            headers["Sec-Fetch-Site"] = "same-origin"
+        else:
+            headers["Sec-Fetch-Dest"] = "empty"
+            headers["Sec-Fetch-Mode"] = "cors" if _FETCH_LIKE_RE.match(resource_type) else "no-cors"
+            headers["Sec-Fetch-Site"] = "same-origin"
+        if not headers.get("Referer"):
             try:
-                link_el = await el.query_selector(link_sel)
-                href = (await link_el.get_attribute("href")).strip() if link_el else ""
+                url = str(request.url or "")
             except Exception:
-                href = ""
-        if not job_id_raw and href:
-            m = re.search(r"jl=(\d+)", href)
-            if m:
-                job_id_raw = m.group(1)
-        job_id = str(job_id_raw).strip() if job_id_raw else None
-        card_key = job_id or href
-        if not card_key:
-            if total_seen % progress_step == 0 or total_seen == total_cards:
-                log.info(
-                    "Glassdoor parse progress: %d/%d cards seen, matched_post_filter_this_batch=%d, matched_after_filters_total=%d",
-                    total_seen, total_cards, new_added, len(out_rows),
-                )
-            continue
-        if card_key in seen_card_keys:
-            if total_seen % progress_step == 0 or total_seen == total_cards:
-                log.info(
-                    "Glassdoor parse progress: %d/%d cards seen, matched_post_filter_this_batch=%d, matched_after_filters_total=%d",
-                    total_seen, total_cards, new_added, len(out_rows),
-                )
-            continue
-        seen_card_keys.add(card_key)
+                url = ""
+            host = ""
+            try:
+                host = urlparse(url).netloc.lower()
+            except Exception:
+                host = ""
+            if host and not host.endswith("google.com"):
+                headers["Referer"] = "https://www.google.com/"
+    except Exception:
+        pass
+    try:
+        await route.continue_(headers=headers)
+    except Exception:
         try:
-            company_el = await el.query_selector(company_sel)
-            company = (await company_el.inner_text()).strip() if company_el else ""
+            await route.continue_()
         except Exception:
-            company = ""
+            pass
+
+
+_AUTH_INIT_JS = r"""
+(() => {
+  const closeBtnSel = 'button[data-test="auth-modal-close-button"]';
+  const dialogSel = 'dialog[aria-modal="true"]';
+  const topSectionSel = 'div[data-test="unified-auth-modal-top-section"]';
+  const backdropSel = 'div[data-test="modal-backdrop"], [data-test*="ModalBackdrop"]';
+
+  function dismissAuthOnce() {
+    let changed = false;
+    try {
+      const btn = document.querySelector(closeBtnSel);
+      if (btn && btn.isConnected) {
+        try { btn.click(); changed = true; } catch (_) {}
+      }
+    } catch (_) {}
+    try {
+      const topSec = document.querySelector(topSectionSel);
+      if (topSec && topSec.isConnected) {
+        const host = topSec.closest('dialog, [role="dialog"], [aria-modal="true"]')
+                   || topSec.parentElement?.closest('[aria-modal="true"]')
+                   || (topSec.parentElement?.parentElement);
+        if (host) {
+          if (typeof host.close === 'function') { try { host.close(); } catch (_) {} }
+          host.removeAttribute('open');
+          host.setAttribute('aria-hidden', 'true');
+          host.style.display = 'none';
+          host.style.visibility = 'hidden';
+          changed = true;
+        }
+      }
+    } catch (_) {}
+    try {
+      document.querySelectorAll(dialogSel).forEach((d) => {
+        const content = d.innerHTML || '';
+        if (
+          content.includes('unified-auth-modal') ||
+          content.includes('auth-modal-close-button') ||
+          d.querySelector(topSectionSel)
+        ) {
+          if (typeof d.close === 'function') { try { d.close(); } catch (_) {} }
+          d.removeAttribute('open');
+          d.setAttribute('aria-hidden', 'true');
+          d.style.display = 'none';
+          d.style.visibility = 'hidden';
+          changed = true;
+        }
+      });
+    } catch (_) {}
+    try {
+      document.querySelectorAll(backdropSel).forEach((b) => {
+        b.style.display = 'none';
+        b.style.visibility = 'hidden';
+        b.style.pointerEvents = 'none';
+      });
+    } catch (_) {}
+    try {
+      if (document.body.style.overflow === 'hidden' || document.documentElement.style.overflow === 'hidden') {
+        if (document.querySelector(topSectionSel) || document.querySelector(closeBtnSel)) {
+          document.body.style.overflow = '';
+          document.documentElement.style.overflow = '';
+        }
+      }
+    } catch (_) {}
+    return changed;
+  }
+
+  let lastDismissAt = 0;
+  function poll() {
+    try {
+      const changed = dismissAuthOnce();
+      if (changed) {
+        const now = Date.now();
+        if (now - lastDismissAt > 400) { lastDismissAt = now; }
+      }
+    } catch (_) {}
+    setTimeout(poll, 250);
+  }
+
+  try {
+    const mo = new MutationObserver(() => {
+      try { dismissAuthOnce(); } catch (_) {}
+    });
+    mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['open', 'aria-modal', 'class', 'style'] });
+  } catch (_) {}
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', poll, { once: true });
+  } else {
+    poll();
+  }
+})();
+"""
+
+_EXTRACT_CARD_JS = """(liEl) => {
+  const qs = (root, sel) => (root ? root.querySelector(sel) : null);
+  const txt = (el) => (el && typeof el.textContent === 'string' ? el.textContent.trim() : '');
+  const safe = (s) => (typeof s === 'string' ? s.trim() : '');
+
+  const employerName = '';
+  const empNameEl = qs(liEl, 'span[class*="EmployerProfile_compactEmployerName__"], div[class*="EmployerProfile_employerNameContainer__"] span[class*="EmployerProfile_employerNameHeading"]');
+  const companyText = (empNameEl && (empNameEl.textContent || empNameEl.innerText || '')).toString().trim() || '';
+
+  const titleEl = qs(liEl, 'a[data-test="job-title"], a[class*="JobCard_jobTitle__"]');
+  const title = txt(titleEl) || '';
+
+  const locEl = qs(liEl, '[data-test="emp-location"], [class*="JobCard_location__"]');
+  const location = txt(locEl) || '';
+
+  const salEl = qs(liEl, '[data-test="detailSalary"], [class*="JobCard_salaryEstimate__"]');
+  const salaryRaw = txt(salEl) || '';
+  let salary = salaryRaw;
+  if (salaryRaw) {
+    const br = salaryRaw.indexOf('(');
+    if (br > 0) salary = salaryRaw.slice(0, br).trim();
+  }
+
+  let url = '';
+  const urlEls = liEl.querySelectorAll('a[data-test="job-title"], a[class*="JobCard_jobTitle__"]');
+  for (const ue of urlEls) {
+    const h = ue.getAttribute && ue.getAttribute('href');
+    if (h) { url = h; break; }
+  }
+  if (!url) {
+    const alt = liEl.querySelectorAll('a[data-test="job-link"], a[class*="JobCard_trackingLink__"]');
+    for (const ue of alt) {
+      const h = ue.getAttribute && ue.getAttribute('href');
+      if (h) { url = h; break; }
+    }
+  }
+  if (url && !url.startsWith('http')) {
+    try { url = new URL(url, location.href).href; } catch (_) {}
+  }
+
+  return {
+    "Job title": safe(title) || null,
+    "company": safe(companyText) || null,
+    "location": safe(location) || null,
+    "salary": safe(salary) || null,
+    "url": safe(url) || null,
+  };
+}"""
+
+
+def _absolutize(url: str, base: str) -> str:
+    u = (url or "").strip()
+    if not u:
+        return ""
+    if u.startswith("http://") or u.startswith("https://"):
+        return u
+    try:
+        from urllib.parse import urljoin
+        return urljoin(base, u)
+    except Exception:
+        return u
+
+
+async def _dismiss_with_locator_if_visible(page: Page) -> bool:
+    close_sel = 'button[data-test="auth-modal-close-button"]'
+    top_sel = 'div[data-test="unified-auth-modal-top-section"]'
+    dialog_sel = 'dialog[aria-modal="true"]'
+    try:
+        has_top = False
         try:
-            loc_el = await el.query_selector(location_sel)
-            location = (await loc_el.inner_text()).strip() if loc_el else ""
+            has_top = bool(await page.evaluate(
+                f'() => !!document.querySelector(' + repr(top_sel) + ')'
+            ))
         except Exception:
-            location = ""
+            has_top = False
+        if not has_top:
+            return False
+    except Exception:
+        pass
+    try:
         try:
-            sal_el = await el.query_selector(salary_sel)
-            salary = (await sal_el.inner_text()).strip() if sal_el else ""
-        except Exception:
-            salary = ""
-        if href and href.startswith("/"):
-            href = "https://www.glassdoor.com" + href
-        if sample_logged < SAMPLE_LOG_FIRST_CARDS:
-            log.info(
-                "Glassdoor card id=%s title=%r company=%r location=%r salary=%r href=%r",
-                job_id or href[:80],
-                title,
-                company,
-                location,
-                salary,
-                href[:100] if href else href,
+            vis = await page.evaluate(
+                """([closeSel]) => {
+                    const btn = document.querySelector(closeSel);
+                    if (!btn) return false;
+                    const st = btn.ownerDocument && btn.ownerDocument.defaultView ? btn.ownerDocument.defaultView.getComputedStyle(btn) : null;
+                    if (!st) return !!btn.isConnected;
+                    return st.display !== 'none' && st.visibility !== 'hidden';
+                }""",
+                [close_sel],
             )
-            sample_logged += 1
-        row = _normalize_job(title, company, location, salary, href, job_id, query, location_filter)
-        if row is None:
-            reasons: list[str] = []
-            if not title or not company or not href:
-                reasons.append(f"missing_field(title={bool(title)} company={bool(company)} href={bool(href)})")
-            else:
-                if not _matches_query(query, title, company, location):
-                    reasons.append(f"query_filter(query={query!r} tokens_hit={len(_tokens(query) & _tokens(f'{title} {company} {location}'))}/{len(_tokens(query))})")
-                if not _matches_location(location_filter, location):
-                    reasons.append(f"location_filter(want={location_filter!r} got={location!r})")
-            if sample_logged <= SAMPLE_LOG_FIRST_CARDS and reasons:
-                log.info(
-                    "Glassdoor card id=%s REJECTED: %s",
-                    job_id or href[:80],
-                    " AND ".join(reasons),
+            if vis:
+                await page.evaluate(
+                    """([closeSel, topSel, dialogSel]) => {
+                        let changed = 0;
+                        try {
+                            const b = document.querySelector(closeSel);
+                            if (b && b.isConnected && typeof b.click === 'function') { b.click(); changed++; }
+                        } catch (_) {}
+                        try {
+                            const top = document.querySelector(topSel);
+                            if (top && top.isConnected) {
+                                const host = top.closest('dialog, [role="dialog"], [aria-modal="true"]')
+                                           || (top.parentElement && top.parentElement.closest('[aria-modal="true"]'));
+                                if (host) {
+                                    if (typeof host.close === 'function') { try { host.close(); } catch (_) {} }
+                                    host.removeAttribute('open');
+                                    host.style.display = 'none';
+                                    changed++;
+                                }
+                            }
+                        } catch (_) {}
+                        try {
+                            document.querySelectorAll(dialogSel).forEach((d) => {
+                                const h = d.innerHTML || '';
+                                if (h.indexOf('unified-auth-modal') !== -1 || h.indexOf('auth-modal-close') !== -1 || d.querySelector(topSel)) {
+                                    if (typeof d.close === 'function') { try { d.close(); } catch (_) {} }
+                                    d.removeAttribute('open');
+                                    d.style.display = 'none';
+                                    changed++;
+                                }
+                            });
+                        } catch (_) {}
+                        return changed;
+                    }""",
+                    [close_sel, top_sel, dialog_sel],
                 )
-            if total_seen % progress_step == 0 or total_seen == total_cards:
-                log.info(
-                    "Glassdoor parse progress: %d/%d cards seen, matched_post_filter_this_batch=%d, matched_after_filters_total=%d",
-                    total_seen, total_cards, new_added, len(out_rows),
-                )
-            continue
-        out_rows.append(row)
-        new_added += 1
-        if total_seen % progress_step == 0 or total_seen == total_cards:
-            log.info(
-                "Glassdoor parse progress: %d/%d cards seen, matched_post_filter_this_batch=%d, matched_after_filters_total=%d",
-                total_seen, total_cards, new_added, len(out_rows),
-            )
-    return total_seen, new_added
+                return True
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+def _count_lis(page: Page, li_sel: str) -> int:
+    pass
+
+
+async def _count_li_count(page: Page, li_sel: str) -> int:
+    try:
+        n = await page.evaluate(
+            """(sel) => {
+                const list = document.querySelectorAll(sel);
+                return list ? list.length : 0;
+            }""",
+            li_sel,
+        )
+    except Exception:
+        return 0
+    try:
+        return int(n or 0)
+    except Exception:
+        return 0
+
+
+async def _batch_extract(page: Page, li_sel: str, start_idx: int = 0) -> list[dict[str, Any]]:
+    try:
+        raw: Any = await page.evaluate(
+            """([liSel, cardFn, startIdx]) => {
+                const fn = eval('(' + cardFn + ')');
+                const nodes = document.querySelectorAll(liSel);
+                const out = [];
+                const end = nodes ? nodes.length : 0;
+                for (let i = startIdx; i < end; i++) {
+                    try { out.push(fn(nodes[i])); }
+                    catch (e) { out.push({ "Job title": null, "company": null, "location": null, "salary": null, "url": null }); }
+                }
+                return out;
+            }""",
+            [li_sel, _EXTRACT_CARD_JS, int(start_idx)],
+        )
+    except Exception as e:
+        log.warning("batch_extract evaluate exc: %s", e)
+        return []
+    if not isinstance(raw, list):
+        return []
+    return [r for r in raw if isinstance(r, dict)]
+
+
+async def _submit_search(page: Page, query: str, location_filter: str) -> str:
+    job_sel = "#searchBar-jobTitle"
+    loc_sel = "#searchBar-location"
+    try:
+        role = page.locator(job_sel)
+        await role.wait_for(timeout=30_000, state="visible")
+        await role.click(timeout=4000)
+        await page.wait_for_timeout(int(_jitter(300, 600)))
+        await role.fill(query, timeout=6000)
+        await page.wait_for_timeout(int(_jitter(600, 1200)))
+    except Exception as e:
+        raise GlassdoorScrapeError(f"role input failed: {e}")
+    try:
+        loc = page.locator(loc_sel)
+        await loc.wait_for(timeout=30_000, state="visible")
+        await loc.click(timeout=4000)
+        await page.wait_for_timeout(int(_jitter(300, 600)))
+        await loc.fill(location_filter, timeout=6000)
+        await page.wait_for_timeout(int(_jitter(600, 1200)))
+    except Exception as e:
+        raise GlassdoorScrapeError(f"location input failed: {e}")
+    try:
+        async with page.expect_navigation(timeout=NAVIGATE_TIMEOUT_MS, wait_until="domcontentloaded") as nav:
+            await page.locator(loc_sel).press("Enter", timeout=6000)
+        resp = await nav.value
+        new_url = str(resp.url) if resp else ""
+    except Exception:
+        new_url = page.url
+    return new_url or ""
 
 
 async def _search_and_collect(
     page: Page,
     query: str,
     location_filter: str,
-    stats: dict[str, Any],
-    run_stamp: str,
-    start_ts: float,
-    target_cap: Optional[int] = None,
+    target_cap: Optional[int],
 ) -> list[JobListing]:
+    try:
+        await page.wait_for_timeout(int(_jitter(3000, 5000)))
+    except Exception:
+        pass
+    try:
+        await _dismiss_with_locator_if_visible(page)
+    except Exception:
+        pass
+
+    ul_sel = 'ul[aria-label="Jobs List"][class*="JobsList_jobsList__"]'
+    li_sel = ul_sel + " > li"
+    load_more_btn_sel = 'button[data-test="load-more"]'
+
+    try:
+        await page.wait_for_selector(ul_sel, timeout=30_000, state="visible")
+    except Exception as e:
+        raise GlassdoorScrapeError(f"jobs list ul not found: {e}")
+
+    total = await _count_li_count(page, li_sel)
+    if total == 0:
+        try:
+            await page.evaluate(
+                '() => { const n = document.querySelector(\'ul[aria-label="Jobs List"]\'); if (n) n.scrollIntoView({block: "start"}); window.scrollBy(0, 600); }'
+            )
+            await page.wait_for_timeout(1500)
+            total = await _count_li_count(page, li_sel)
+        except Exception:
+            pass
+    if total == 0:
+        raise GlassdoorScrapeError("no li children found under jobs list ul")
+
+    seen_urls: set[str] = set()
     out_rows: list[JobListing] = []
-    seen_card_keys: set[str] = set()
-    stats["start_url"] = str(page.url)
-    await page.wait_for_timeout(int(_jitter(1.0, 2.0) * 1000))
-    try:
-        role = page.locator("#searchBar-jobTitle")
-        await role.wait_for(state="visible", timeout=15_000)
-        await role.click(timeout=4000, force=True)
-        await page.wait_for_timeout(int(_jitter(300, 600)))
-        await role.fill(query, timeout=4000)
-        log.info("Glassdoor filled role field: %r", query)
-    except Exception as e:
-        log.warning("Glassdoor role field fill failed: %s", e)
-    await page.wait_for_timeout(int(_jitter(400, 800)))
-    loc = page.locator("#searchBar-location")
-    try:
-        await loc.wait_for(state="visible", timeout=12_000)
-        await loc.click(timeout=4000, force=True)
-        await page.wait_for_timeout(int(_jitter(300, 600)))
-        try:
-            await loc.click(click_count=3, timeout=2000)
-        except Exception:
-            pass
-        await loc.fill(location_filter or "", timeout=4000)
-        log.info("Glassdoor filled location field: %r", location_filter or "")
-    except Exception as e:
-        log.warning("Glassdoor location field fill failed: %s", e)
-    await page.wait_for_timeout(int(_jitter(400, 800)))
-    url_before_submit = str(page.url)
-    stats["url_before_submit"] = url_before_submit
-    log.info("Glassdoor URL before submit: %s", url_before_submit)
-
-    async def _try_submit() -> bool:
-        try:
-            focused: bool = False
-            try:
-                await loc.focus(timeout=2000)
-                focused = True
-            except Exception:
-                focused = False
-            try:
-                await loc.press("Enter", timeout=5000)
-                log.info("Glassdoor submitted via loc.press(Enter) focused=%s", focused)
-                return True
-            except Exception as pe:
-                log.warning("Glassdoor loc.press(Enter) failed: %s: fallback global keyboard", pe)
-                try:
-                    await page.keyboard.press("Enter")
-                    log.info("Glassdoor submitted via global keyboard.Enter")
-                    return True
-                except Exception as ke:
-                    log.warning("Glassdoor global keyboard.Enter failed: %s: try search button", ke)
-                    sb = await page.query_selector(
-                        "button[type='submit'], button[aria-label*='search' i], form button, "
-                        "div[class*='SearchBar'] button, button[data-test='search-submit']"
-                    )
-                    if sb is not None:
-                        try:
-                            await sb.click(force=True, timeout=3000)
-                            log.info("Glassdoor submitted via search button click(force=True)")
-                            return True
-                        except Exception as cbe:
-                            try:
-                                await page.evaluate(
-                                    "(b) => { if (b && b.dispatchEvent) b.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window})); }",
-                                    sb,
-                                )
-                                log.info("Glassdoor submitted via search button dispatchEvent")
-                                return True
-                            except Exception:
-                                pass
-                    log.error("Glassdoor ALL submit strategies failed (loc Enter, global Enter, search button)")
-                    return False
-        except Exception as outer:
-            log.error("Glassdoor _try_submit unexpected: %s", outer)
-            return False
-
-    async def _wait_url_change(prev_url: str, timeout_ms: int = 45_000) -> bool:
-        deadline = time.monotonic() + timeout_ms / 1000.0
-        slept = 0
-        while time.monotonic() < deadline:
-            cur = str(page.url)
-            if cur != prev_url and ("job" in cur.lower() or "/Job/" in cur or "jobs" in cur.lower()):
-                log.info("Glassdoor URL changed after submit (took %dms): %s", slept, cur)
-                return True
-            try:
-                h = await page.evaluate("() => window.location.href")
-                if isinstance(h, str) and h != prev_url and ("job" in h.lower() or "/Job/" in h):
-                    log.info("Glassdoor location.href changed (took %dms): %s", slept, h)
-                    return True
-            except Exception:
-                pass
-            await page.wait_for_timeout(200)
-            slept += 200
-        return False
-
-    submitted_ok = await _try_submit()
-    if not submitted_ok:
-        raise GlassdoorScrapeError("Failed to submit Glassdoor search form (all strategies failed)")
-    url_changed = await _wait_url_change(url_before_submit, timeout_ms=45_000)
-    if not url_changed:
-        retry_submit = await _try_submit()
-        log.warning("Glassdoor URL didn't change 45s after first submit; retry_submit=%s", retry_submit)
-        url_changed = await _wait_url_change(url_before_submit, timeout_ms=30_000)
-        if not url_changed:
-            cur = str(page.url)
-            log.error(
-                "Glassdoor URL STILL same after submit (before=%s now=%s). Results will not load. "
-                "Extra settle wait before proceeding.",
-                url_before_submit, cur,
-            )
-            await page.wait_for_timeout(3000)
-    try:
-        await page.wait_for_load_state("networkidle", timeout=15_000)
-    except Exception:
-        pass
-    try:
-        await page.wait_for_load_state("domcontentloaded", timeout=8_000)
-    except Exception:
-        pass
-    results_loc = page.locator(
-        "ul[aria-label='Jobs List'], div[class*='JobsList_wrapper'], div.JobsList_wrapper__EyUF6, li[data-test='jobListing']"
-    ).first
-    try:
-        await results_loc.wait_for(state="attached", timeout=35_000)
-        log.info("Glassdoor results wrapper / first job listing attached on results page.")
-    except Exception as rwe:
-        log.warning(
-            "Glassdoor results wrapper not attached after submit (timeout 35s): %s. "
-            "Proceeding anyway: maybe empty results or wrapper changed.",
-            rwe,
-        )
-    await page.wait_for_timeout(SEARCH_SETTLE_MS + int(_jitter(800, 1600)))
-    await _snapshot(page, f"{run_stamp}_step1_after_submit")
-    try:
-        body_text = await page.inner_text("body", timeout=4000)
-    except Exception:
-        body_text = ""
-    stats["wall_signals_after_submit"] = _wall_signals(body_text)
-    try:
-        wrapper_sel = "ul[aria-label='Jobs List'], div[class*='JobsList_wrapper'], div.JobsList_wrapper__EyUF6"
-        list_wrapper = await page.query_selector(wrapper_sel)
-        if list_wrapper is None:
-            log.warning("Glassdoor no JobsList wrapper (aria-label/hashed) found after submit.")
-    except Exception as e:
-        log.warning("Glassdoor wrapper locate err: %s", e)
-    batch_seen, batch_added = await _extract_cards(page, seen_card_keys, out_rows, query, location_filter)
-    stats["initial_cards"] = int(batch_seen)
-    url_after_submit = str(page.url)
-    stats["url_after_submit"] = url_after_submit
-    still_on_index = (
-        url_before_submit == url_after_submit
-        or "/Job/index.htm" in url_after_submit
-        or ("/index.htm" in url_after_submit and "kw=" not in url_after_submit and "job/" not in url_after_submit.lower())
-    )
-    if still_on_index and batch_seen == 0:
-        extra_wait = int(_jitter(5000, 9000))
-        log.warning(
-            "Glassdoor after submit: still on index page (no URL change) and 0 initial cards. "
-            "Extra %dms settle + re-extract + one last Enter retry.",
-            extra_wait,
-        )
-        await page.wait_for_timeout(extra_wait)
-        try:
-            await results_loc.wait_for(state="attached", timeout=25_000)
-        except Exception:
-            pass
-        await page.wait_for_timeout(int(_jitter(2000, 4000)))
-        batch2_seen, batch2_added = await _extract_cards(page, seen_card_keys, out_rows, query, location_filter)
-        stats["initial_cards"] = int(stats.get("initial_cards", 0) or 0) + int(batch2_seen)
-        if batch2_seen == 0:
-            log.error("Glassdoor: second extract also 0 cards and still on index URL. Triggering one last Enter retry.")
-            try:
-                await loc.focus(timeout=2000)
-            except Exception:
-                pass
-            await page.keyboard.press("Enter")
-            await page.wait_for_timeout(8000)
-            url_third = str(page.url)
-            log.info("Glassdoor post-retry-Enter URL: %s", url_third)
-            try:
-                await results_loc.wait_for(state="attached", timeout=30_000)
-            except Exception as final_err:
-                log.error(
-                    "Glassdoor results wrapper still missing after final retry Enter: %s. url_before=%s url_after=%s",
-                    final_err, url_before_submit, url_third,
-                )
-            batch3_seen, _ = await _extract_cards(page, seen_card_keys, out_rows, query, location_filter)
-            stats["initial_cards"] = int(stats.get("initial_cards", 0) or 0) + int(batch3_seen)
-    log.info(
-        "Glassdoor initial batch: seen=%d matched_post_filter_this_batch=%d matched_after_filters_total=%d rows_now=%d url=%s",
-        batch_seen,
-        batch_added,
-        len(out_rows),
-        len(out_rows),
-        url_after_submit,
-    )
-    load_more_clicks = 0
+    page_base = page.url or ""
     stop_reason = ""
-    consecutive_no_growth = 0
-    for idx in range(1, MAX_LOAD_MORE_CLICKS + 1):
-        if time.monotonic() - start_ts >= SCRAPER_TOTAL_TIMEOUT_SECONDS:
-            stop_reason = "scraper_timeout"
-            break
-        if target_cap is not None and len(out_rows) >= target_cap:
-            stop_reason = "max_jobs_met"
-            log.info(
-                "Glassdoor post-filter row count %d >= target_cap %d => stop condition 3 (max-count satisfied).",
-                len(out_rows), target_cap,
-            )
-            break
-        try:
-            btn = await page.query_selector("button[data-test='load-more']")
-            if btn is None:
-                log.info("Glassdoor 'Show more jobs' button[data-test='load-more'] not found => all pages exhausted.")
-                stop_reason = "all_pages_exhausted"
-                break
-            visible = await btn.is_visible()
-            disabled = False
-            try:
-                disabled = await btn.is_disabled()
-            except Exception:
-                disabled = False
-            loading = False
-            try:
-                dl = await btn.get_attribute("data-loading")
-                loading = str(dl).lower() == "true"
-            except Exception:
-                loading = False
-            if (not visible) or disabled or loading:
+
+    async def _ingest(batch: list[dict[str, Any]], start_label: str) -> tuple[int, int]:
+        kept_now = 0
+        seen_now = 0
+        for i, row in enumerate(batch):
+            if not isinstance(row, dict):
+                continue
+            seen_now += 1
+            title = str(row.get("Job title") or "")
+            company = str(row.get("company") or "")
+            loc = str(row.get("location") or "")
+            sal = str(row.get("salary") or "")
+            u_raw = str(row.get("url") or "")
+            url = _absolutize(u_raw, page_base)
+            if not url:
+                continue
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            listing = _normalize_job(title, company, loc, sal, url, query, location_filter)
+            if listing is None:
+                continue
+            out_rows.append(listing)
+            kept_now += 1
+            if len(out_rows) <= SAMPLE_LOG_FIRST_N_CARDS:
                 log.info(
-                    "Glassdoor button present but not clickable (visible=%s disabled=%s loading=%s) => all pages exhausted.",
-                    visible,
-                    disabled,
-                    loading,
+                    "progress %d/%d keep=%d keep_total=%d",
+                    len(out_rows),
+                    total,
+                    kept_now,
+                    len(out_rows),
                 )
-                stop_reason = "all_pages_exhausted"
-                break
-        except Exception as e:
-            log.warning("Glassdoor load-more locate err: %s => stop exhausted", e)
+            if target_cap is not None and len(out_rows) >= target_cap:
+                return seen_now, kept_now
+        return seen_now, kept_now
+
+    def _log_progress(seen_total: int) -> None:
+        if seen_total % 5 == 0 or (seen_total == total):
+            log.info(
+                "progress %d/%d keep=%d keep_total=%d",
+                seen_total,
+                max(total, seen_total),
+                0,
+                len(out_rows),
+            )
+
+    initial_batch = await _batch_extract(page, li_sel, 0)
+    if not initial_batch:
+        try:
+            await page.evaluate(
+                '() => { const n = document.querySelector(\'ul[aria-label="Jobs List"]\'); if (n) n.scrollIntoView({block: "start"}); window.scrollBy(0, 600); }'
+            )
+            await page.wait_for_timeout(1500)
+            initial_batch = await _batch_extract(page, li_sel, 0)
+        except Exception:
+            pass
+    if initial_batch:
+        for idx_diag in range(min(RAW_DUMP_FIRST_N_CARDS, len(initial_batch))):
+            r = initial_batch[idx_diag]
+            if isinstance(r, dict):
+                log.info(
+                    "GLASS_DOOR_RAW_CARD_%d/%d: jlid=<n/a> title=%r location=%r salary=%r",
+                    idx_diag + 1,
+                    RAW_DUMP_FIRST_N_CARDS,
+                    str(r.get("Job title") or "")[:120],
+                    str(r.get("location") or "")[:80],
+                    str(r.get("salary") or "")[:100],
+                )
+    _seen, _kept = await _ingest(initial_batch, "batch-0")
+    cursor_total = len(initial_batch) if isinstance(initial_batch, list) else total
+    _log_progress(cursor_total)
+    log.info(
+        "initial page  seen=%d  keep=%d  keep_total=%d  url=%s",
+        cursor_total,
+        len(out_rows),
+        len(out_rows),
+        (page.url or "")[:160],
+    )
+    if target_cap is not None and len(out_rows) >= target_cap:
+        stop_reason = "max_listings_satisfied"
+
+    load_more_clicks = 0
+    consecutive_no_growth = 0
+    last_batch_before = len(out_rows)
+
+    while not stop_reason and load_more_clicks < MAX_LOAD_MORE_BATCHES:
+        if target_cap is not None and len(out_rows) >= target_cap:
+            stop_reason = "max_listings_satisfied"
+            break
+        initial_count = cursor_total
+        try:
+            btn_exists = bool(await page.evaluate(
+                f'() => {{ const b = document.querySelector({repr(load_more_btn_sel)}); if (!b) return false; const st = b.ownerDocument && b.ownerDocument.defaultView ? b.ownerDocument.defaultView.getComputedStyle(b) : null; if (!st) return !!b.isConnected; return st.display !== "none" && st.visibility !== "hidden" && !b.hasAttribute("disabled"); }}'
+            ))
+        except Exception:
+            btn_exists = False
+        if not btn_exists:
+            log.info("load-more button absent => done")
             stop_reason = "all_pages_exhausted"
             break
         try:
-            await btn.scroll_into_view_if_needed()
-            await page.wait_for_timeout(int(_jitter(200, 500)))
-            try:
-                close_btns = await page.query_selector_all(
-                    "dialog[open] button[aria-label*='close' i], dialog[open] button svg, "
-                    "div[role='dialog'] button[aria-label*='close' i], button[aria-label='Close modal'], "
-                    "div[class*='Modal'] button[aria-label*='close' i]"
-                )
-                for cb in close_btns[:3]:
-                    try:
-                        cv = await cb.is_visible()
-                        if cv:
-                            await cb.click(force=True)
-                            await page.wait_for_timeout(350)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            try:
-                await page.evaluate(
-                    "() => { document.querySelectorAll('dialog[open]').forEach(d => d.close && d.close()); }"
-                )
-                await page.wait_for_timeout(250)
-            except Exception:
-                pass
-            try:
-                await btn.click(timeout=4000, force=True)
-                load_more_clicks += 1
-            except Exception as ce:
-                try:
-                    await page.evaluate(
-                        "(b) => { b.dispatchEvent(new MouseEvent('click', {bubbles:true,cancelable:true,view:window})); }",
-                        btn,
-                    )
-                    load_more_clicks += 1
-                except Exception:
-                    raise ce
-        except Exception as e:
-            log.warning("Glassdoor load-more click failed (iter %d): %s", idx, e)
-            consecutive_no_growth += 1
-            if consecutive_no_growth >= 3:
-                stop_reason = "all_pages_exhausted"
-                break
-            await page.wait_for_timeout(int(_jitter(500, 1200)))
-            continue
-        try:
-            await page.wait_for_timeout(LOAD_MORE_WAIT_MS_AFTER_CLICK + int(_jitter(200, 600)))
-            prev_h = 0
-            stable = 0
-            for _ in range(5):
-                try:
-                    h = await page.evaluate(
-                        "() => { window.scrollBy(0, Math.max(400, Math.floor(document.body.scrollHeight*0.18))); return document.body.scrollHeight; }"
-                    )
-                except Exception:
-                    h = 0
-                await page.wait_for_timeout(PAGE_IDLE_MS)
-                if isinstance(h, int) and h <= prev_h:
-                    stable += 1
-                    if stable >= 2:
-                        break
-                prev_h = int(h or 0)
+            await page.evaluate(
+                f'() => {{ const b = document.querySelector({repr(load_more_btn_sel)}); if (b) b.scrollIntoView({{block: "center", inline: "center"}}); window.scrollBy(0, 150); }}'
+            )
         except Exception:
             pass
-        before = len(seen_card_keys)
-        batch_seen, new_added = await _extract_cards(page, seen_card_keys, out_rows, query, location_filter)
-        new_cards = len(seen_card_keys) - before
-        log.info(
-            "Glassdoor load-more iter=%d clicks_done=%d batch_seen=%d batch_matched_post_filter=%d new_cards=%d matched_after_filters_total=%d matched_rows=%d",
-            idx,
-            load_more_clicks,
-            batch_seen,
-            new_added,
-            new_cards,
-            len(out_rows),
-            new_added,
-        )
-        if new_cards == 0:
+        await page.wait_for_timeout(int(_jitter(400, 900)))
+        try:
+            await page.locator(load_more_btn_sel).click(timeout=10_000)
+            load_more_clicks += 1
+        except Exception as e:
+            log.warning("Glassdoor load-more click failed (iter %d): %s", load_more_clicks, e)
+            consecutive_no_growth += 1
+            if consecutive_no_growth >= 2:
+                stop_reason = "all_pages_exhausted"
+                break
+            continue
+        polled_new = 0
+        deadline = time.monotonic() + LOAD_MORE_POLL_DEADLINE_SEC
+        while time.monotonic() < deadline:
+            try:
+                now_count = await _count_li_count(page, li_sel)
+            except Exception:
+                now_count = initial_count
+            if now_count > initial_count:
+                polled_new = now_count - initial_count
+                break
+            try:
+                await page.evaluate(
+                    f'() => {{ const b = document.querySelector({repr(load_more_btn_sel)}); if (b) b.scrollIntoView({{block: "center"}}); window.scrollBy(0, 120); }}'
+                )
+            except Exception:
+                pass
+            await page.wait_for_timeout(400)
+        try:
+            after_count = await _count_li_count(page, li_sel)
+        except Exception:
+            after_count = initial_count
+        new_added = max(after_count - initial_count, polled_new)
+        if new_added <= 0:
             consecutive_no_growth += 1
             if consecutive_no_growth >= 3:
-                log.info("Glassdoor 3 consecutive clicks with 0 new cards => all pages exhausted")
+                log.info("3 consecutive clicks with 0 new lis => done")
+                stop_reason = "all_pages_exhausted"
+                break
+            await page.wait_for_timeout(int(_jitter(700, 1400)))
+            continue
+        consecutive_no_growth = 0
+        post_batch = await _batch_extract(page, li_sel, initial_count)
+        if post_batch:
+            await _ingest(post_batch, f"batch-{load_more_clicks}")
+        cursor_total = initial_count + new_added
+        _log_progress(cursor_total)
+        if len(out_rows) == last_batch_before:
+            consecutive_no_growth += 1
+            if consecutive_no_growth >= 3:
                 stop_reason = "all_pages_exhausted"
                 break
         else:
             consecutive_no_growth = 0
+            last_batch_before = len(out_rows)
+
     if not stop_reason:
-        stop_reason = "max_load_more_clicks"
-    await _snapshot(page, f"{run_stamp}_step2_final")
-    stats["load_more_clicks"] = int(load_more_clicks)
-    stats["stop_reason"] = stop_reason
-    stats["elapsed_s"] = round(time.monotonic() - start_ts, 2)
-    stats["total_cards_seen"] = int(len(seen_card_keys))
-    stats["total_cards_matched_precap"] = int(len(out_rows))
-    stats["status"] = 200
+        stop_reason = "max_load_more_batches"
+
     log.info(
-        "Glassdoor final: seen=%d matched=%d clicks=%d stop=%s elapsed_s=%.2f",
-        stats.get("total_cards_seen", 0),
-        stats.get("total_cards_matched_precap", 0),
-        stats.get("load_more_clicks", 0),
-        stats.get("stop_reason", ""),
-        float(stats.get("elapsed_s", 0.0)),
+        "final  seen=%d  keep=%d  clicks=%d  stop=%s  elapsed=%.2fs",
+        cursor_total,
+        len(out_rows),
+        load_more_clicks,
+        stop_reason,
+        0.0,
     )
+    if target_cap is not None and len(out_rows) > target_cap:
+        out_rows = out_rows[:target_cap]
     return out_rows
 
 
 @dataclass(frozen=True)
 class _BrowserHandles:
     ctx: BrowserContext
-    browser: Browser | None = None
+    browser: Optional[Browser] = None
 
 
 async def _launch_context(pw: Playwright) -> _BrowserHandles:
-    ctx = await pw.chromium.launch_persistent_context(
+    args = [
+        "--no-sandbox",
+        "--disable-blink-features=AutomationControlled",
+        "--start-maximized",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+    ]
+    ctx: BrowserContext = await pw.chromium.launch_persistent_context(
         user_data_dir=str(PROFILE_DIR),
         channel="chrome",
         headless=False,
-        viewport=VIEWPORT,
+        args=args,
+        no_viewport=True,
+        viewport=None,
         locale="en-US",
-        extra_http_headers={"Accept-Language": LANGS},
-        args=[
-            "--no-sandbox",
-            "--disable-blink-features=AutomationControlled",
+        timezone_id="America/New_York",
+        extra_http_headers={
+            "Accept-Language": LANGS,
+            "Sec-CH-UA-Mobile": "?0",
+            "Sec-CH-UA-Platform": '"Windows"',
+        },
+        ignore_default_args=[
+            "--enable-automation",
         ],
+        handle_sigint=False,
+        handle_sigterm=False,
+        handle_sighup=False,
     )
-    await ctx.route("**/*", _route_stealth)
     return _BrowserHandles(ctx=ctx, browser=None)
 
 
@@ -726,8 +864,6 @@ async def scrape(
     target_cap: Optional[int] = int(max_listings) if isinstance(max_listings, int) and max_listings > 0 else None
     last_err: Optional[str] = None
     collected: list[JobListing] = []
-    stats: dict[str, Any] = {}
-    run_stamp = time.strftime("%Y%m%d_%H%M%S") + f"_{int((time.time_ns() % 1_000_000) // 1000):03d}"
     start_ts = time.monotonic()
     try:
         if not external_pw:
@@ -735,12 +871,20 @@ async def scrape(
         assert playwright is not None
         for attempt in range(1, NAVIGATE_MAX_ATTEMPTS + 1):
             log.info("Glassdoor launch attempt %d/%d (headless=False, real Chrome channel=chrome, persistent profile)", attempt, NAVIGATE_MAX_ATTEMPTS)
-            ctx: BrowserContext | None = None
-            handles: _BrowserHandles | None = None
-            page: Page | None = None
+            ctx: Optional[BrowserContext] = None
+            handles: Optional[_BrowserHandles] = None
+            page: Optional[Page] = None
             try:
                 handles = await _launch_context(playwright)
                 ctx = handles.ctx
+                try:
+                    await ctx.route("**/*", _route_stealth)
+                except Exception:
+                    pass
+                try:
+                    await ctx.add_init_script(_AUTH_INIT_JS)
+                except Exception:
+                    pass
                 pages = ctx.pages
                 page = pages[0] if pages else await ctx.new_page()
                 try:
@@ -749,12 +893,13 @@ async def scrape(
                     if attempt < NAVIGATE_MAX_ATTEMPTS:
                         log.warning("Glassdoor initial goto timeout (attempt %d): %s", attempt, e)
                         try:
+                            if page:
+                                await page.wait_for_timeout(int(_jitter(1500, 2500)))
                             await ctx.close()
                         except Exception:
                             pass
                         ctx = None
                         handles = None
-                        await _sleep(1.5, 2.5)
                         continue
                     else:
                         last_err = f"nav timeout after {NAVIGATE_MAX_ATTEMPTS} attempts: {e}"
@@ -763,29 +908,24 @@ async def scrape(
                     if attempt < NAVIGATE_MAX_ATTEMPTS:
                         log.warning("Glassdoor nav error (attempt %d): %s", attempt, e)
                         try:
+                            if page:
+                                await page.wait_for_timeout(int(_jitter(1500, 2500)))
                             await ctx.close()
                         except Exception:
                             pass
                         ctx = None
                         handles = None
-                        await _sleep(1.5, 2.5)
                         continue
                     else:
                         last_err = f"nav error after {NAVIGATE_MAX_ATTEMPTS} attempts: {e}"
                         break
                 assert page is not None
-                await _snapshot(page, f"{run_stamp}_attempt{attempt}_initial_load")
-                try:
-                    body_text = await page.inner_text("body", timeout=3500)
-                except Exception:
-                    body_text = ""
-                walls = _wall_signals(body_text)
-                stats["wall_signals_initial"] = walls
+                await page.wait_for_timeout(int(_jitter(2500, 4500)))
                 try:
                     title_text = await page.title()
                 except Exception:
                     title_text = ""
-                log.info("Glassdoor loaded: title=%r signals=%s", title_text, list(walls.keys()))
+                log.info("loaded title=%s", title_text[:100])
                 bad_title_markers = (
                     "502",
                     "503",
@@ -797,18 +937,18 @@ async def scrape(
                 )
                 t_low = title_text.lower()
                 bad_title = any(m in t_low for m in bad_title_markers)
-                hard_walls = [k for k in ("captcha_wall", "cloudflare_wall") if k in walls]
-                if bad_title or hard_walls:
-                    err = f"bad glassdoor landing (title={title_text!r} hard_walls={hard_walls})"
+                if bad_title:
+                    err = f"bad glassdoor landing title={title_text!r}"
                     if attempt < NAVIGATE_MAX_ATTEMPTS:
                         log.warning("Glassdoor %s: retry %d/%d", err, attempt, NAVIGATE_MAX_ATTEMPTS)
                         try:
+                            if page:
+                                await page.wait_for_timeout(int(_jitter(2000, 3500)))
                             await ctx.close()
                         except Exception:
                             pass
                         ctx = None
                         handles = None
-                        await _sleep(2.0, 3.5)
                         continue
                     else:
                         last_err = err
@@ -830,23 +970,40 @@ async def scrape(
                     if attempt < NAVIGATE_MAX_ATTEMPTS:
                         log.warning("Glassdoor %s: retry %d/%d", err, attempt, NAVIGATE_MAX_ATTEMPTS)
                         try:
+                            if page:
+                                await page.wait_for_timeout(int(_jitter(2000, 3500)))
                             await ctx.close()
                         except Exception:
                             pass
                         ctx = None
                         handles = None
-                        await _sleep(2.0, 3.5)
                         continue
                     else:
                         last_err = err
+                        break
+                try:
+                    result_url = await _submit_search(page, query, location)
+                    if result_url:
+                        log.info("URL changed after submit (took 0ms): %s", result_url[:160])
+                except Exception as e:
+                    last_err = f"submit failed: {e}"
+                    if attempt < NAVIGATE_MAX_ATTEMPTS:
+                        log.warning("Glassdoor %s retry %d/%d", last_err, attempt, NAVIGATE_MAX_ATTEMPTS)
+                        try:
+                            if page:
+                                await page.wait_for_timeout(int(_jitter(2000, 3500)))
+                            await ctx.close()
+                        except Exception:
+                            pass
+                        ctx = None
+                        handles = None
+                        continue
+                    else:
                         break
                 rows = await _search_and_collect(
                     page=page,
                     query=query,
                     location_filter=location,
-                    stats=stats,
-                    run_stamp=run_stamp,
-                    start_ts=start_ts,
                     target_cap=target_cap,
                 )
                 collected.extend(rows)
@@ -854,7 +1011,11 @@ async def scrape(
             except Exception as e:
                 last_err = f"{type(e).__name__}: {e}"
                 log.warning("Glassdoor launch err (attempt %d): %s", attempt, last_err)
-                await _sleep(1.5, 2.5)
+                try:
+                    if page:
+                        await page.wait_for_timeout(int(_jitter(1500, 2500)))
+                except Exception:
+                    pass
             finally:
                 if ctx is not None:
                     try:
@@ -872,12 +1033,7 @@ async def scrape(
                 await playwright.stop()
             except Exception:
                 pass
+    _ = start_ts
     if not collected and last_err:
         log.warning("Glassdoor: no rows collected, last_err=%s", last_err)
     return collected
-
-
-async def _sleep(lo: float, hi: float) -> None:
-    import asyncio
-
-    await asyncio.sleep(_jitter(lo, hi))
