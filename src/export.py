@@ -86,7 +86,7 @@ def write_csv(
         writer.writerow(list(CSV_KEY_ORDER))
         for row in enriched:
             writer.writerow([_cell_value(row, key) for key in CSV_KEY_ORDER])
-    log.info("CSV written: %s (%d rows)", csv_path, len(enriched))
+    log.info("csv %s (%d rows)", csv_path, len(enriched))
     return str(csv_path)
 
 
@@ -119,7 +119,7 @@ def write_json(
     with json_path.open("w", encoding="utf-8") as fh:
         json.dump(normalized, fh, ensure_ascii=False, indent=JSON_INDENT)
         fh.write("\n")
-    log.info("JSON written: %s (%d rows)", json_path, len(normalized))
+    log.info("json %s (%d rows)", json_path, len(normalized))
     return str(json_path)
 
 

@@ -13,7 +13,7 @@ log: logging.Logger = logging.getLogger(__name__)
 PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
 DOTENV_PATH: Final[Path] = PROJECT_ROOT / ".env"
 
-LOG_FORMAT: Final[str] = "%(asctime)s %(levelname)s %(name)s %(message)s"
+LOG_FORMAT: Final[str] = "%(asctime)s %(name)s %(message)s"
 DEFAULT_LOG_LEVEL: Final[str] = "INFO"
 ALLOWED_LOG_LEVELS: Final[frozenset[str]] = frozenset(
     {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}

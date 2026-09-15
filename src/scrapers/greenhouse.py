@@ -346,7 +346,7 @@ async def scrape(
                     matched_this_page += 1
                     board_matched_total += 1
             log.info(
-                "Greenhouse board=%s page=%s/%s status=%s raw_batch=%d batch_matched=%d running_total=%d cap=%s",
+                "board=%s p=%d/%d status=%s raw=%d matched=%d total=%d cap=%s",
                 token,
                 page,
                 BOARD_MAX_PAGES_PER_BOARD,
@@ -380,7 +380,7 @@ async def scrape(
                 break
     elapsed_s = round(time.monotonic() - start_ts, 2)
     log.info(
-        "Greenhouse aggregate: rows=%d cap=%s stop_reason=%s elapsed_s=%s fetches=%s pages_walked=%s boards_total=%s",
+        "done  rows=%d cap=%s stop=%s elapsed=%.2fs fetches=%d pages=%d boards=%d",
         len(all_results),
         target_cap,
         stop_reason,

@@ -21,7 +21,7 @@ REQUIRED_FIELDS: set[str] = {
     "scraped_at",
 }
 
-ALLOWED_SOURCES: set[str] = {"greenhouse", "glassdoor", "flexjobs"}
+ALLOWED_SOURCES: set[str] = {"greenhouse", "glassdoor"}
 
 URL_HASH_FIELD: str = "url_hash"
 

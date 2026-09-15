@@ -25,7 +25,6 @@ from .config import (
 from .http_utils import MaxRetriesExceeded
 from .pipeline import PipelineResult, run_pipeline
 from .scrapers.glassdoor import GlassdoorScrapeError
-from .scrapers.flexjobs import FlexJobsScrapeError
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -45,10 +44,8 @@ _LEVEL_COLORS: dict[str, str] = {
 _SOURCE_COLORS: dict[str, str] = {
     "greenhouse": "\033[38;5;45m",
     "glassdoor": "\033[38;5;208m",
-    "flexjobs": "\033[38;5;87m",
     "src.scrapers.greenhouse": "\033[38;5;45m",
     "src.scrapers.glassdoor": "\033[38;5;208m",
-    "src.scrapers.flexjobs": "\033[38;5;87m",
     "src.pipeline": "\033[38;5;81m",
     "src.storage": "\033[38;5;72m",
     "src.export": "\033[38;5;190m",
@@ -73,11 +70,28 @@ def _supports_color(stream: object) -> bool:
 
 
 def _short_name(full_name: str) -> str:
-    if full_name.startswith("src.scrapers."):
-        return full_name.split("src.scrapers.", 1)[1]
-    if full_name.startswith("src."):
-        return full_name.split("src.", 1)[1]
-    return full_name
+    n = full_name
+    if n.startswith("src.scrapers."):
+        n = n.split("src.scrapers.", 1)[1]
+    elif n.startswith("src."):
+        n = n.split("src.", 1)[1]
+    if n.startswith("greenhouse.") or n == "greenhouse":
+        n = "greenhouse"
+    elif n.startswith("glassdoor.") or n == "glassdoor":
+        n = "glassdoor"
+    elif n.startswith("pipeline.") or n == "pipeline":
+        n = "pipeline"
+    elif n.startswith("storage.") or n == "storage":
+        n = "storage"
+    elif n.startswith("export.") or n == "export":
+        n = "export"
+    elif n.startswith("cli.") or n == "cli":
+        n = "cli"
+    elif n.startswith("config.") or n == "config":
+        n = "config"
+    elif n.startswith("http_utils.") or n == "http_utils":
+        n = "http"
+    return n
 
 
 class _ColoredFormatter(logging.Formatter):
@@ -88,25 +102,47 @@ class _ColoredFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         if not self.use_color:
             record.name = _short_name(record.name)
-            return super().format(record)
-        level_color = _LEVEL_COLORS.get(record.levelname, "")
+            prefix = ""
+            if record.levelno >= logging.CRITICAL:
+                prefix = "[CRIT] "
+            elif record.levelno >= logging.ERROR:
+                prefix = "[ERR] "
+            elif record.levelno >= logging.WARNING:
+                prefix = "[WARN] "
+            if prefix:
+                record.msg = prefix + str(record.msg)
+            base = super().format(record)
+            return "\n\n" + base
         source_color = ""
         for k, v in _SOURCE_COLORS.items():
             if record.name == k or record.name.startswith(k + "."):
                 source_color = v
                 break
         display_name = _short_name(record.name)
-        colored_name = f"{source_color}{display_name}{_ANSI_RESET}"
-        colored_level = f"{_ANSI_BOLD}{level_color}{record.levelname:<8}{_ANSI_RESET}"
+        colored_name = f"{_ANSI_BOLD}{source_color}{display_name:<12}{_ANSI_RESET}"
         asctime_raw = self.formatTime(record, "%Y-%m-%d %H:%M:%S")
-        colored_time = f"{_ANSI_GREY}{asctime_raw}{_ANSI_RESET}"
-        msg = super().format(record)
-        parts = msg.split(" ", 3)
-        if len(parts) >= 4:
-            body = parts[3]
+        colored_time = f"{_ANSI_DIM}{_ANSI_GREY}{asctime_raw}{_ANSI_RESET}"
+        level_prefix = ""
+        msg_color = ""
+        if record.levelno >= logging.CRITICAL:
+            level_prefix = f"{_ANSI_BOLD}{_LEVEL_COLORS['CRITICAL']}[CRIT]{_ANSI_RESET} "
+            msg_color = _LEVEL_COLORS["CRITICAL"]
+        elif record.levelno >= logging.ERROR:
+            level_prefix = f"{_ANSI_BOLD}{_LEVEL_COLORS['ERROR']}[ERR]{_ANSI_RESET} "
+            msg_color = _LEVEL_COLORS["ERROR"]
+        elif record.levelno >= logging.WARNING:
+            level_prefix = f"{_ANSI_BOLD}{_LEVEL_COLORS['WARNING']}[WARN]{_ANSI_RESET} "
+            msg_color = _LEVEL_COLORS["WARNING"]
         else:
-            body = record.getMessage()
-        return f"{colored_time} {colored_level} {colored_name} {body}"
+            msg_color = "\033[38;5;252m"
+        msg = record.getMessage()
+        if record.args:
+            try:
+                msg = msg % record.args
+            except Exception:
+                pass
+        body = f"{level_prefix}{msg_color}{msg}{_ANSI_RESET}"
+        return f"\n\n{colored_time} {colored_name} {body}"
 
 
 _RULE_CHAR = "─"
@@ -136,7 +172,7 @@ def _final_summary(
         ("Location", repr(location)),
         ("Listings returned", str(len(listings))),
     ]
-    for src in ("greenhouse", "glassdoor", "flexjobs"):
+    for src in ("greenhouse", "glassdoor"):
         rows.append((f"  - {src}", str(by_source.get(src, 0))))
     exports = result.get("exports")
     if exports is not None:
@@ -152,9 +188,9 @@ DEFAULT_LOG_LEVEL_CLI: Final[str] = ""
 DEFAULT_LOG_FILE_CLI: Final[str] = ""
 
 DESCRIPTION: Final[str] = (
-    "Multi-Source Job Board Aggregator - scrape Greenhouse, Glassdoor, "
-    "and FlexJobs in parallel, deduplicate by URL, persist to MongoDB, "
-    "and export per-run output to CSV + JSON."
+    "Multi-Source Job Board Aggregator - scrape Greenhouse and Glassdoor "
+    "in parallel, deduplicate by URL, persist to MongoDB, and export "
+    "per-run output to CSV + JSON."
 )
 
 EPILOG: Final[str] = (
@@ -219,8 +255,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--max-listings",
-        default=None,
-        help="Maximum listings to keep in-memory post-dedup, before DB/export writes. Default: unlimited.",
+        default=20,
+        help="Maximum listings to keep post-dedup, before DB/export writes. Highest-priority terminator. Default: 20.",
         type=int,
         dest="max_listings",
     )
@@ -286,7 +322,7 @@ def configure_logging(*, cli_log_level: str, cli_log_file: str) -> None:
     if final_log_file:
         log_path = Path(final_log_file).resolve()
         if not log_path.parent.exists():
-            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.mkdir(parents=True, exist_ok=True)
         file_handler = logging.FileHandler(log_path, encoding="utf-8")
         file_handler.setFormatter(plain_formatter)
         root_logger.addHandler(file_handler)
@@ -361,9 +397,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except GlassdoorScrapeError as exc:
         log.error("Glassdoor scraper failed: %s", exc)
         return 4
-    except FlexJobsScrapeError as exc:
-        log.error("FlexJobs scraper failed: %s", exc)
-        return 5
     _banner("EXPORT + FINALIZE", level=logging.INFO)
     listings = result["listings"]
     exports = result["exports"]

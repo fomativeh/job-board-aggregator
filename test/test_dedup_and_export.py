@@ -85,8 +85,8 @@ def test_validate_listing_rejects_weworkremotely_source_removed() -> None:
         validate_listing(removed)
 
 
-def test_validate_listing_accepts_all_three_current_sources() -> None:
-    for src in ("greenhouse", "glassdoor", "flexjobs"):
+def test_validate_listing_accepts_all_current_sources() -> None:
+    for src in ("greenhouse", "glassdoor"):
         good = _make_listing(f"https://ex.com/{src}", source=src)
         validate_listing(good)
         assert good["source"] == src
@@ -149,10 +149,9 @@ def test_dedup_in_memory_no_duplicates_empty_drop() -> None:
 def test_write_csv_json_shared_timestamp(tmp_path: Path) -> None:
     l1 = _make_listing("https://ex.com/1", salary="$80k")
     l2 = _make_listing("https://ex.com/2", salary=None, source="glassdoor")
-    l3 = _make_listing("https://ex.com/3", salary="$120k", source="flexjobs")
     ts = "20260903_001122"
     with patch("src.export._run_timestamp", return_value=ts):
-        out = write_both([l1, l2, l3], output_dir=str(tmp_path))
+        out = write_both([l1, l2], output_dir=str(tmp_path))
     expected_csv = str(tmp_path / f"job_listings_{ts}.csv")
     expected_json = str(tmp_path / f"job_listings_{ts}.json")
     assert out["csv_path"] == expected_csv
@@ -162,7 +161,7 @@ def test_write_csv_json_shared_timestamp(tmp_path: Path) -> None:
     assert "job_listings_20260903_001122.csv" in out["csv_path"]
     csv_rows = Path(out["csv_path"]).read_text(encoding="utf-8").splitlines()
     sources = sorted(r.split(",")[5] for r in csv_rows[1:])
-    assert sources == ["flexjobs", "glassdoor", "greenhouse"]
+    assert sources == ["glassdoor", "greenhouse"]
 
 
 def test_write_csv_header_order_and_salary_null_empty(tmp_path: Path) -> None:
@@ -257,7 +256,7 @@ def test_build_headers_contextualizes_sec_fetch_and_referer() -> None:
         referer="https://boards.greenhouse.io/",
     )
     cross = build_headers(
-        "https://www.flexjobs.com/search?searchkeyword=engineer&joblocations=remote",
+        "https://www.glassdoor.com/Job/remote-python-jobs-SRCH_IL.0,6_IS11047_KO7,13.htm",
         referer="https://google.com/",
     )
     assert same["Sec-Fetch-Site"] == "same-origin"
@@ -266,6 +265,9 @@ def test_build_headers_contextualizes_sec_fetch_and_referer() -> None:
     assert cross["Referer"] == "https://google.com/"
     for h in (same, cross):
         assert "Accept-Language" in h
+
+
+# cli log level coercion and fallback
 
 
 def test_coerce_log_level_case_insensitive() -> None:
@@ -316,6 +318,9 @@ def test_load_config_log_fields_default_safely(tmp_path: Path) -> None:
                 os.environ[k] = v
             else:
                 os.environ.pop(k, None)
+
+
+# Config dataclass and load_config tests
 
 
 def test_config_post_init_rejects_bad_mongo_uri_scheme() -> None:

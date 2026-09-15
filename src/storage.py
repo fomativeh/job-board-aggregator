@@ -63,7 +63,7 @@ class Storage:
         self._collection = db[self.config.mongo_collection]
         self._ensure_indexes()
         log.info(
-            "Connected to MongoDB db=%s collection=%s",
+            "mongo connected  db=%s collection=%s",
             self.config.mongo_db,
             self.config.mongo_collection,
         )
@@ -79,7 +79,7 @@ class Storage:
             self._client.close()
             self._client = None
             self._collection = None
-            log.info("MongoDB connection closed")
+            log.info("mongo closed")
 
     def _get_collection(self) -> Collection[Any]:
         if self._collection is None:
@@ -111,8 +111,8 @@ class Storage:
             failed_indexes: set[int] = {err["index"] for err in write_errors}
             inserted = len(docs) - len(failed_indexes)
             duplicates = len(failed_indexes)
-            log.warning(
-                "Bulk insert hit %d duplicate URL hashes; %d new listings inserted",
+            log.info(
+                "[dedup ok] %d already stored; %d new inserted",
                 duplicates,
                 inserted,
             )
@@ -145,14 +145,14 @@ class Storage:
                     other_errors[:3],
                 )
             else:
-                log.warning(
-                    "Bulk insert hit %d duplicate URL hashes; %d new listings inserted",
+                log.info(
+                    "[dedup ok] %d already stored; %d new inserted",
                     duplicates,
                     inserted,
                 )
 
         log.info(
-            "insert_many_unique complete: inserted=%d duplicates_skipped=%d total_in=%d",
+            "batch complete  inserted=%d already_stored=%d total_in=%d",
             inserted,
             duplicates,
             len(listings),
